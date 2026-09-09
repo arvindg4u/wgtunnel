@@ -540,9 +540,14 @@ func cmdRestart(args []string) {
 			"--interval", "1800", "--route", "opencode.ai", "--verbose"}
 	}
 	fmt.Println("Starting:", "wgtunnel", strings.Join(saved, " "))
+	logF, err := os.OpenFile("/tmp/wgtunnel.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		fmt.Println("❌ log file:", err)
+		os.Exit(1)
+	}
 	cmd := exec.Command(os.Args[0], saved...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = logF
+	cmd.Stderr = logF
 	cmd.Stdin = nil
 	if err := cmd.Start(); err != nil {
 		fmt.Println("❌ start failed:", err)
