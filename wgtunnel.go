@@ -301,8 +301,113 @@ func cmdRotate(args []string) {
 	fmt.Printf("✅ Active peer [%d] %s\n", idx, peers[idx].Name)
 }
 
-func cmdStatus(args []string) {
-	fs := flag.NewFlagSet("status", flag.ExitOnError)
+func cmdList(args []string) {
+	fs := flag.NewFlagSet("list", flag.ExitOnError)
+	peersPath := fs.String("peers", "peers.json", "peer pool JSON")
+	iface := fs.String("iface", "flare", "wireguard interface")
+	fs.Parse(args)
+	peers, err := loadPeers(*peersPath)
+	if err != nil || len(peers) == 0 {
+		fmt.Println("❌ load peers:", err)
+		os.Exit(1)
+	}
+	// Detect active peer by matching the configured endpoint.
+	active := -1
+	if dump, err := sh("wg", "show", *iface, "endpoints"); err == nil {
+		for i, p := range peers {
+			if strings.Contains(dump, p.Endpoint) {
+				active = i
+				break
+			}
+		}
+	}
+	age := handshakeAge(*iface)
+	fmt.Printf("%-4s %-22s %-24s %s\n", "#", "NAME", "ENDPOINT", "STATUS")
+	for i, p := range peers {
+		st := ""
+		if i == active {
+			if age >= 0 {
+				st = fmt.Sprintf("✅ ACTIVE (handshake %ds ago)", age)
+			} else {
+				st = "⚠️  ACTIVE (no handshake yet)"
+			}
+		}
+		fmt.Printf("%-4d %-22s %-24s %s\n", i, p.Name, p.Endpoint, st)
+	}
+}
+
+// cmdTest checks exit IP per peer on a scratch interface (default wgtest)
+// without touching the live proxy interface. Restores test routes after.
+func cmdTest(args []string) {
+	fs := flag.NewFlagSet("test", flag.ExitOnError)
+	peersPath := fs.String("peers", "peers.json", "peer pool JSON")
+	iface := fs.String("iface", "wgtest", "scratch wireguard interface")
+	peerIdx := fs.Int("peer", -1, "test single peer index (default: all)")
+	timeout := fs.Int("timeout", 25, "handshake wait seconds per peer")
+	fs.Parse(args)
+	peers, err := loadPeers(*peersPath)
+	if err != nil || len(peers) == 0 {
+		fmt.Println("❌ load peers:", err)
+		os.Exit(1)
+	}
+	targets := []int{}
+	if *peerIdx >= 0 {
+		if *peerIdx >= len(peers) {
+			fmt.Println("❌ peer index out of range")
+			os.Exit(1)
+		}
+		targets = append(targets, *peerIdx)
+	} else {
+		for i := range peers {
+			targets = append(targets, i)
+		}
+	}
+	ensureDaemon(*iface)
+	// Resolve probe host once (direct DNS).
+	probeIPOut, err := sh("python3", "-c", "import socket;print(socket.gethostbyname('api.ipify.org'))")
+	if err != nil {
+		fmt.Println("❌ dns failed:", err)
+		os.Exit(1)
+	}
+	probeIP := strings.TrimSpace(probeIPOut)
+	defer func() {
+		sh("ip", "route", "del", probeIP+"/32", "dev", *iface)
+		sh("ip", "rule", "del", "to", probeIP+"/32", "lookup", "main", "pref", "99")
+		sh("ip", "link", "del", "dev", *iface)
+	}()
+	fmt.Printf("%-4s %-22s %-16s %s\n", "#", "NAME", "ENDPOINT", "EXIT IP")
+	for _, i := range targets {
+		p := peers[i]
+		if err := applyPeer(*iface, p); err != nil {
+			fmt.Printf("%-4d %-22s %-16s ✗ apply: %v\n", i, p.Name, p.Endpoint, err)
+			continue
+		}
+		ok := false
+		deadline := time.Now().Add(time.Duration(*timeout) * time.Second)
+		for time.Now().Before(deadline) {
+			time.Sleep(2 * time.Second)
+			if age := handshakeAge(*iface); age >= 0 && age < 120 {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			fmt.Printf("%-4d %-22s %-16s ✗ no handshake\n", i, p.Name, p.Endpoint)
+			continue
+		}
+		sh("ip", "route", "replace", probeIP+"/32", "dev", *iface)
+		sh("ip", "rule", "add", "to", probeIP+"/32", "lookup", "main", "pref", "99")
+		out, err := sh("curl", "-s", "--max-time", "15",
+			"--resolve", "api.ipify.org:443:"+probeIP, "https://api.ipify.org")
+		if err != nil || out == "" || strings.Contains(out, "<") {
+			fmt.Printf("%-4d %-22s %-16s ✗ probe failed\n", i, p.Name, p.Endpoint)
+			continue
+		}
+		fmt.Printf("%-4d %-22s %-16s ✅ %s\n", i, p.Name, p.Endpoint, out)
+	}
+}
+
+func cmdStatus(args []string) {	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	iface := fs.String("iface", "flare", "wireguard interface")
 	fs.Parse(args)
 	out, err := sh("wg", "show", *iface)
@@ -328,7 +433,7 @@ func cmdStatus(args []string) {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: wgtunnel <proxy|rotate|status> [options]")
+		fmt.Println("Usage: wgtunnel <proxy|rotate|status|list|test> [options]")
 		os.Exit(1)
 	}
 	switch os.Args[1] {
@@ -338,6 +443,10 @@ func main() {
 		cmdRotate(os.Args[2:])
 	case "status":
 		cmdStatus(os.Args[2:])
+	case "list":
+		cmdList(os.Args[2:])
+	case "test":
+		cmdTest(os.Args[2:])
 	default:
 		fmt.Println("Unknown command:", os.Args[1])
 		os.Exit(1)
