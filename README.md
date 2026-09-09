@@ -48,7 +48,14 @@ cp peers.json.example peers.json   # fill in real keys (never commit!)
 
 `proxy` flags: `--route` re-applies policy routes every 15s (Android
 flushes them); `--blocklist` blocks telemetry/tracker domains with 403
-before they touch the VPN; `--interval 0` disables rotation.
+before they touch the VPN; `--dns` routes system DNS via the tunnel
+(rewrites resolv.conf, restores on exit); `--interval 0` disables rotation
+(default 1800s, minimum 600s).
+
+Safety: a health monitor watches handshakes — if the tunnel dies, routed
+destinations flip to `prohibit` routes (**killswitch**, fail-closed instead
+of leaking direct). Rotation pre-warms the next peer on a standby interface
+and flips only after a verified handshake, with backoff on failures.
 
 > ⚠️ Go slow: rotating or mass-testing too fast triggers server-side
 > session throttling (handshakes succeed, data stops). Prefer `--interval`
