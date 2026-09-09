@@ -46,6 +46,7 @@ cp peers.json.example peers.json   # fill in real keys (never commit!)
 ./wgtunnel import --input peers-backup.json          # restore
 ./wgtunnel stop                                      # stop proxy
 ./wgtunnel restart                                   # stop + start (same flags)
+./wgtunnel boot                                      # full stack: proxy -> gateway (idempotent)
 ```
 
 `proxy` flags: `--route` re-applies policy routes every 15s (Android
