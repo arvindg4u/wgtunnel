@@ -91,7 +91,33 @@ func applyPeer(iface string, p Peer) error {
 	return nil
 }
 
-// handshakeAge returns seconds since last handshake, or -1 if none.
+// ensureRoute routes hostOrCIDR via dev (main table + policy rule).
+// Idempotent; safe to call periodically (Android flushes rules).
+func ensureRoute(hostOrCIDR, dev string) {
+	dst := hostOrCIDR
+	if !strings.Contains(dst, "/") {
+		ips, err := net.LookupHost(dst)
+		if err != nil || len(ips) == 0 {
+			fmt.Printf("   ⚠️  dns failed for %s: %v\n", dst, err)
+			return
+		}
+		for _, ip := range ips {
+			if strings.Contains(ip, ":") {
+				continue // v4 only for now
+			}
+			ensureRoute(ip+"/32", dev)
+		}
+		return
+	}
+	sh("ip", "route", "replace", dst, "dev", dev)
+	sh("ip", "rule", "add", "to", dst, "lookup", "main", "pref", "100")
+}
+
+// pathOK reports whether kernel would send ip via dev.
+func pathOK(ip, dev string) bool {
+	out, err := sh("ip", "route", "get", ip)
+	return err == nil && strings.Contains(out, "dev "+dev)
+}
 func handshakeAge(iface string) int64 {
 	out, err := sh("wg", "show", iface, "latest-handshakes")
 	if err != nil {
@@ -215,6 +241,7 @@ func cmdProxy(args []string) {
 	iface := fs.String("iface", "flare", "wireguard interface")
 	interval := fs.Int("interval", 300, "peer rotation seconds (0 = no rotation)")
 	timeout := fs.Int("timeout", 25, "handshake wait seconds per peer")
+	routes := fs.String("route", "", "comma-separated hosts/CIDRs to route via tunnel (re-applied every 60s)")
 	verbose := fs.Bool("verbose", false, "verbose logging")
 	fs.Parse(args)
 
@@ -235,22 +262,50 @@ func cmdProxy(args []string) {
 	fmt.Printf("📡 Listening: %s\n", *listen)
 	fmt.Printf("🔗 Active peer: [%d] %s\n", idx, peers[idx].Name)
 	fmt.Printf("🔄 Rotation: every %ds across %d peers\n", *interval, len(peers))
+	if *routes != "" {
+		fmt.Printf("🛣️  Routed: %s (re-applied every 15s)\n", *routes)
+		for _, r := range strings.Split(*routes, ",") {
+			ensureRoute(strings.TrimSpace(r), *iface)
+		}
+	}
 	fmt.Println("📝 Proxy Configuration:")
 	fmt.Printf("   HTTP Proxy:  %s\n", *listen)
 	fmt.Printf("   HTTPS Proxy: %s\n", *listen)
 
-	if *interval > 0 {
+	if *interval > 0 || *routes != "" {
 		go func() {
 			cur := idx
+			// Re-apply routes frequently (Android netd flushes ip rules).
+			routeTick := time.NewTicker(15 * time.Second)
+			defer routeTick.Stop()
+			rotTick := time.NewTicker(time.Duration(*interval) * time.Second)
+			if *interval <= 0 {
+				rotTick.Stop()
+			} else {
+				defer rotTick.Stop()
+			}
 			for {
-				time.Sleep(time.Duration(*interval) * time.Second)
-				next, err := activate(*iface, peers, cur+1, *timeout, *verbose)
-				if err != nil {
-					fmt.Println("⚠️  rotation failed, keeping current peer:", err)
-					continue
+				select {
+				case <-routeTick.C:
+					if *routes != "" {
+						for _, r := range strings.Split(*routes, ",") {
+							ensureRoute(strings.TrimSpace(r), *iface)
+						}
+					}
+				case <-rotTick.C:
+					next, err := activate(*iface, peers, cur+1, *timeout, *verbose)
+					if err != nil {
+						fmt.Println("⚠️  rotation failed, keeping current peer:", err)
+						continue
+					}
+					cur = next
+					fmt.Printf("🔄 Rotated to peer [%d] %s\n", cur, peers[cur].Name)
+					if *routes != "" {
+						for _, r := range strings.Split(*routes, ",") {
+							ensureRoute(strings.TrimSpace(r), *iface)
+						}
+					}
 				}
-				cur = next
-				fmt.Printf("🔄 Rotated to peer [%d] %s\n", cur, peers[cur].Name)
 			}
 		}()
 	}
@@ -343,6 +398,7 @@ func cmdTest(args []string) {
 	peersPath := fs.String("peers", "peers.json", "peer pool JSON")
 	iface := fs.String("iface", "wgtest", "scratch wireguard interface")
 	peerIdx := fs.Int("peer", -1, "test single peer index (default: all)")
+	delay := fs.Int("delay", 8, "seconds between peers (avoids server-side session throttling)")
 	timeout := fs.Int("timeout", 25, "handshake wait seconds per peer")
 	fs.Parse(args)
 	peers, err := loadPeers(*peersPath)
@@ -376,7 +432,7 @@ func cmdTest(args []string) {
 		sh("ip", "link", "del", "dev", *iface)
 	}()
 	fmt.Printf("%-4s %-22s %-16s %s\n", "#", "NAME", "ENDPOINT", "EXIT IP")
-	for _, i := range targets {
+	for ti, i := range targets {
 		p := peers[i]
 		if err := applyPeer(*iface, p); err != nil {
 			fmt.Printf("%-4d %-22s %-16s ✗ apply: %v\n", i, p.Name, p.Endpoint, err)
@@ -397,13 +453,29 @@ func cmdTest(args []string) {
 		}
 		sh("ip", "route", "replace", probeIP+"/32", "dev", *iface)
 		sh("ip", "rule", "add", "to", probeIP+"/32", "lookup", "main", "pref", "99")
-		out, err := sh("curl", "-s", "--max-time", "15",
-			"--resolve", "api.ipify.org:443:"+probeIP, "https://api.ipify.org")
+		time.Sleep(2 * time.Second)
+		if !pathOK(probeIP, *iface) {
+			fmt.Printf("%-4d %-22s %-16s ✗ kernel path not via %s\n", i, p.Name, p.Endpoint, *iface)
+			continue
+		}
+		var out string
+		var err error
+		for attempt := 0; attempt < 2; attempt++ {
+			out, err = sh("curl", "-s", "--max-time", "15",
+				"--resolve", "api.ipify.org:443:"+probeIP, "https://api.ipify.org")
+			if err == nil && out != "" && !strings.Contains(out, "<") {
+				break
+			}
+			time.Sleep(3 * time.Second)
+		}
 		if err != nil || out == "" || strings.Contains(out, "<") {
 			fmt.Printf("%-4d %-22s %-16s ✗ probe failed\n", i, p.Name, p.Endpoint)
 			continue
 		}
 		fmt.Printf("%-4d %-22s %-16s ✅ %s\n", i, p.Name, p.Endpoint, out)
+		if ti < len(targets)-1 {
+			time.Sleep(time.Duration(*delay) * time.Second)
+		}
 	}
 }
 
