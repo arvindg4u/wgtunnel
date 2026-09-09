@@ -469,6 +469,88 @@ func handleHTTP(w http.ResponseWriter, r *http.Request, verbose bool, block []st
 	io.Copy(w, resp.Body)
 }
 
+const proxyPIDFile = "/tmp/wgtunnel-proxy.pid"
+const proxyArgsFile = "/tmp/wgtunnel-proxy.args"
+
+func writeProcFiles() {
+	_ = os.WriteFile(proxyPIDFile, []byte(strconv.Itoa(os.Getpid())), 0644)
+	_ = os.WriteFile(proxyArgsFile, []byte(strings.Join(os.Args[1:], "\n")), 0600)
+}
+
+func readProcFiles() (int, []string) {
+	pid := 0
+	if data, err := os.ReadFile(proxyPIDFile); err == nil {
+		pid, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+	}
+	var args []string
+	if data, err := os.ReadFile(proxyArgsFile); err == nil {
+		for _, l := range strings.Split(string(data), "\n") {
+			if l = strings.TrimSpace(l); l != "" && l != "restart" {
+				args = append(args, l)
+			}
+		}
+	}
+	return pid, args
+}
+
+func procAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return p.Signal(syscall.Signal(0)) == nil
+}
+
+func cmdStop(args []string) {
+	pid, _ := readProcFiles()
+	if !procAlive(pid) {
+		// Fallback: scan process list.
+		if out, err := sh("pgrep", "-f", "wgtunnel pro[x]y"); err == nil && out != "" {
+			fmt.Sscanf(strings.Fields(out)[0], "%d", &pid)
+		}
+	}
+	if !procAlive(pid) {
+		fmt.Println("wgtunnel proxy not running")
+		os.Remove(proxyPIDFile)
+		return
+	}
+	fmt.Printf("Stopping wgtunnel proxy (PID %d) ...\n", pid)
+	p, _ := os.FindProcess(pid)
+	p.Signal(syscall.SIGTERM)
+	for i := 0; i < 10 && procAlive(pid); i++ {
+		time.Sleep(500 * time.Millisecond)
+	}
+	if procAlive(pid) {
+		fmt.Println("Still alive, forcing kill ...")
+		p.Signal(syscall.SIGKILL)
+		time.Sleep(time.Second)
+	}
+	os.Remove(proxyPIDFile)
+	fmt.Println("wgtunnel proxy stopped")
+}
+
+func cmdRestart(args []string) {
+	cmdStop(args)
+	_, saved := readProcFiles()
+	if len(saved) == 0 || saved[0] != "proxy" {
+		saved = []string{"proxy", "--iface", "flare", "--listen", "127.0.0.1:8080",
+			"--interval", "1800", "--route", "opencode.ai", "--verbose"}
+	}
+	fmt.Println("Starting:", "wgtunnel", strings.Join(saved, " "))
+	cmd := exec.Command(os.Args[0], saved...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = nil
+	if err := cmd.Start(); err != nil {
+		fmt.Println("❌ start failed:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("wgtunnel proxy starting (PID %d) — safe to close this terminal with nohup\n", cmd.Process.Pid)
+}
+
 func cmdProxy(args []string) {
 	fs := flag.NewFlagSet("proxy", flag.ExitOnError)
 	peersPath := fs.String("peers", "/root/wgtunnel/peers.json", "peer pool JSON")
@@ -633,6 +715,8 @@ func cmdProxy(args []string) {
 		}
 		handleHTTP(w, r, *verbose, block, markActive)
 	})
+	writeProcFiles()
+	defer os.Remove(proxyPIDFile)
 	srv := &http.Server{Addr: *listen, Handler: handler}
 	// Suppress per-request server error spam on hijacked conns.
 	srv.ErrorLog = nil
@@ -883,7 +967,7 @@ func cmdStatus(args []string) {	fs := flag.NewFlagSet("status", flag.ExitOnError
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: wgtunnel <proxy|rotate|status|list|test|export|import|dns> [options]")
+		fmt.Println("Usage: wgtunnel <proxy|rotate|status|list|test|export|import|dns|stop|restart> [options]")
 		os.Exit(1)
 	}
 	switch os.Args[1] {
@@ -903,6 +987,10 @@ func main() {
 		cmdImport(os.Args[2:])
 	case "dns":
 		cmdDNS(os.Args[2:])
+	case "stop":
+		cmdStop(os.Args[2:])
+	case "restart":
+		cmdRestart(os.Args[2:])
 	default:
 		fmt.Println("Unknown command:", os.Args[1])
 		os.Exit(1)
