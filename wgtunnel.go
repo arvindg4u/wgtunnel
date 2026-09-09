@@ -326,8 +326,86 @@ func restoreDNS() {
 	}
 }
 
-func cmdDNS(args []string) {
-	fs := flag.NewFlagSet("dns", flag.ExitOnError)
+// cmdBoot brings up the full stack in order: proxy -> gateway.
+// Safe to re-run: already-running pieces are detected and skipped.
+func cmdBoot(args []string) {
+	fs := flag.NewFlagSet("boot", flag.ExitOnError)
+	interval := fs.Int("interval", 1800, "peer rotation seconds")
+	routes := fs.String("route", "opencode.ai", "hosts/CIDRs to route via tunnel")
+	fs.Parse(args)
+
+	// 1. Proxy (detached, logs to /tmp/wgtunnel.log).
+	pid, _ := readProcFiles()
+	proxyUp := procAlive(pid)
+	if !proxyUp {
+		if out, err := sh("pgrep", "-f", "wgtunnel pro[x]y"); err == nil && out != "" {
+			proxyUp = true
+		}
+	}
+	if proxyUp {
+		fmt.Println("✅ proxy already running, skipping start")
+	} else {
+		fmt.Println("🚀 starting proxy ...")
+		logF, err := os.OpenFile("/tmp/wgtunnel.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			fmt.Println("❌ log file:", err)
+			os.Exit(1)
+		}
+		defer logF.Close()
+		cmd := exec.Command(os.Args[0], "proxy", "--iface", "flare",
+			"--listen", "127.0.0.1:8080", "--interval", strconv.Itoa(*interval),
+			"--route", *routes, "--verbose")
+		cmd.Stdout = logF
+		cmd.Stderr = logF
+		if err := cmd.Start(); err != nil {
+			fmt.Println("❌ proxy start failed:", err)
+			os.Exit(1)
+		}
+		cmd.Process.Release()
+	}
+	// 2. Wait for :8080.
+	ok := false
+	for i := 0; i < 30; i++ {
+		if c, err := net.DialTimeout("tcp", "127.0.0.1:8080", time.Second); err == nil {
+			c.Close()
+			ok = true
+			break
+		}
+		time.Sleep(time.Second)
+	}
+	if !ok {
+		fmt.Println("❌ proxy :8080 not listening after 30s — check /tmp/wgtunnel.log")
+		os.Exit(1)
+	}
+	fmt.Println("✅ proxy listening on 127.0.0.1:8080")
+
+	// 3. Gateway.
+	if out, err := sh("claude-zen", "start"); err != nil {
+		fmt.Println("❌ gateway start failed:", err)
+		fmt.Println(out)
+		os.Exit(1)
+	} else {
+		fmt.Println(out)
+	}
+
+	// 4. Summary.
+	fmt.Println("────────────────────────────────")
+	if out, err := sh("wg", "show", "flare", "endpoints"); err == nil && out != "" {
+		if f := strings.Fields(out); len(f) >= 2 {
+			fmt.Println("🔗 tunnel endpoint:", f[1])
+		}
+	}
+	if age := handshakeAge("flare"); age >= 0 {
+		fmt.Printf("🤝 handshake: %ds ago\n", age)
+	} else {
+		fmt.Println("⚠️  no handshake yet (warming up)")
+	}
+	fmt.Println("📡 proxy:   127.0.0.1:8080")
+	fmt.Println("🤖 gateway: 127.0.0.1:4013 (ANTHROPIC_BASE_URL)")
+	fmt.Println("✅ all up")
+}
+
+func cmdDNS(args []string) {	fs := flag.NewFlagSet("dns", flag.ExitOnError)
 	off := fs.Bool("off", false, "restore system DNS from backup")
 	egress := fs.String("iface", "flare", "wireguard interface carrying DNS")
 	fs.Parse(args)
@@ -972,7 +1050,7 @@ func cmdStatus(args []string) {	fs := flag.NewFlagSet("status", flag.ExitOnError
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: wgtunnel <proxy|rotate|status|list|test|export|import|dns|stop|restart> [options]")
+		fmt.Println("Usage: wgtunnel <proxy|rotate|status|list|test|export|import|dns|stop|restart|boot> [options]")
 		os.Exit(1)
 	}
 	switch os.Args[1] {
@@ -996,6 +1074,8 @@ func main() {
 		cmdStop(os.Args[2:])
 	case "restart":
 		cmdRestart(os.Args[2:])
+	case "boot":
+		cmdBoot(os.Args[2:])
 	default:
 		fmt.Println("Unknown command:", os.Args[1])
 		os.Exit(1)
