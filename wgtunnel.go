@@ -166,12 +166,106 @@ func activate(iface string, peers []Peer, start, timeout int, verbose bool) (int
 	return -1, fmt.Errorf("no healthy peer")
 }
 
+// ---- Blocklist (FlareTunnel idea: block telemetry/trackers before VPN) ----
+
+func loadBlocklist(path string) []string {
+	if path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Printf("⚠️  blocklist not loaded (%s): %v\n", path, err)
+		return nil
+	}
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		out = append(out, strings.ToLower(line))
+	}
+	return out
+}
+
+func blocked(host string, list []string) bool {
+	h := strings.ToLower(strings.Split(host, ":")[0])
+	if net.ParseIP(h) != nil {
+		return false
+	}
+	for _, p := range list {
+		if strings.Contains(h, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// ---- Peer stats (persisted) ----
+
+type PeerStats struct {
+	Requests   int64  `json:"requests"`
+	LastActive string `json:"last_active"`
+	RxBytes    uint64 `json:"rx_bytes"`
+	TxBytes    uint64 `json:"tx_bytes"`
+}
+
+func loadStats(path string) map[string]*PeerStats {
+	m := map[string]*PeerStats{}
+	if data, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(data, &m)
+	}
+	return m
+}
+
+func saveStats(path string, m map[string]*PeerStats) {
+	data, _ := json.MarshalIndent(m, "", "  ")
+	_ = os.WriteFile(path, data, 0600)
+}
+
+// snapshotTransfer records current wg transfer totals for peerName.
+func snapshotTransfer(iface, peerName string, m map[string]*PeerStats) {
+	out, err := sh("wg", "show", iface, "transfer")
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) != 3 {
+			continue
+		}
+		rx, _ := strconv.ParseUint(f[1], 10, 64)
+		tx, _ := strconv.ParseUint(f[2], 10, 64)
+		st := m[peerName]
+		if st == nil {
+			st = &PeerStats{}
+			m[peerName] = st
+		}
+		// Single-peer-at-a-time: totals belong to the active peer.
+		if rx >= st.RxBytes {
+			st.RxBytes = rx
+		}
+		if tx >= st.TxBytes {
+			st.TxBytes = tx
+		}
+		break // only one peer configured at a time
+	}
+}
+
 // ---- HTTP proxy (plain CONNECT passthrough, no MITM) ----
 
 var reqCount int64
 
-func handleCONNECT(w http.ResponseWriter, r *http.Request, verbose bool) {
+func handleCONNECT(w http.ResponseWriter, r *http.Request, verbose bool, block []string, onReq func()) {
 	host := r.Host
+	if blocked(host, block) {
+		if verbose {
+			fmt.Printf("\n🚫 BLOCKED (blocklist): %s\n", host)
+		}
+		http.Error(w, "blocked by wgtunnel blocklist", http.StatusForbidden)
+		return
+	}
+	onReq()
 	if verbose {
 		n := atomic.AddInt64(&reqCount, 1)
 		fmt.Printf("\n🔒 [CONNECT #%d] %s\n", n, host)
@@ -209,7 +303,19 @@ func handleCONNECT(w http.ResponseWriter, r *http.Request, verbose bool) {
 	}()
 }
 
-func handleHTTP(w http.ResponseWriter, r *http.Request, verbose bool) {
+func handleHTTP(w http.ResponseWriter, r *http.Request, verbose bool, block []string, onReq func()) {
+	host := r.Host
+	if host == "" && r.URL != nil {
+		host = r.URL.Host
+	}
+	if blocked(host, block) {
+		if verbose {
+			fmt.Printf("\n🚫 BLOCKED (blocklist): %s\n", host)
+		}
+		http.Error(w, "blocked by wgtunnel blocklist", http.StatusForbidden)
+		return
+	}
+	onReq()
 	if verbose {
 		n := atomic.AddInt64(&reqCount, 1)
 		fmt.Printf("\n📤 [#%d %s] %s\n", n, r.Method, r.URL.String())
@@ -242,6 +348,8 @@ func cmdProxy(args []string) {
 	interval := fs.Int("interval", 300, "peer rotation seconds (0 = no rotation)")
 	timeout := fs.Int("timeout", 25, "handshake wait seconds per peer")
 	routes := fs.String("route", "", "comma-separated hosts/CIDRs to route via tunnel (re-applied every 60s)")
+	blocklist := fs.String("blocklist", "blocklist.txt", "domain blocklist file (empty to disable)")
+	statsPath := fs.String("stats", "/tmp/wgtunnel-stats.json", "peer stats file")
 	verbose := fs.Bool("verbose", false, "verbose logging")
 	fs.Parse(args)
 
@@ -256,12 +364,28 @@ func cmdProxy(args []string) {
 		fmt.Println("❌", err)
 		os.Exit(1)
 	}
+	block := loadBlocklist(*blocklist)
+	stats := loadStats(*statsPath)
+	var activeIdx int64 = int64(idx)
+	markActive := func() {
+		i := int(atomic.LoadInt64(&activeIdx))
+		st := stats[peers[i].Name]
+		if st == nil {
+			st = &PeerStats{}
+			stats[peers[i].Name] = st
+		}
+		st.Requests++
+		st.LastActive = time.Now().UTC().Format(time.RFC3339)
+		saveStats(*statsPath, stats)
+	}
+	markActive()
 	fmt.Println("================================================================================")
 	fmt.Println("🚀 WGTunnel Proxy Started")
 	fmt.Println("================================================================================")
 	fmt.Printf("📡 Listening: %s\n", *listen)
 	fmt.Printf("🔗 Active peer: [%d] %s\n", idx, peers[idx].Name)
 	fmt.Printf("🔄 Rotation: every %ds across %d peers\n", *interval, len(peers))
+	fmt.Printf("🚫 Blocklist: %d pattern(s)\n", len(block))
 	if *routes != "" {
 		fmt.Printf("🛣️  Routed: %s (re-applied every 15s)\n", *routes)
 		for _, r := range strings.Split(*routes, ",") {
@@ -293,12 +417,16 @@ func cmdProxy(args []string) {
 						}
 					}
 				case <-rotTick.C:
+					snapshotTransfer(*iface, peers[cur].Name, stats)
+					saveStats(*statsPath, stats)
 					next, err := activate(*iface, peers, cur+1, *timeout, *verbose)
 					if err != nil {
 						fmt.Println("⚠️  rotation failed, keeping current peer:", err)
 						continue
 					}
 					cur = next
+					atomic.StoreInt64(&activeIdx, int64(cur))
+					markActive()
 					fmt.Printf("🔄 Rotated to peer [%d] %s\n", cur, peers[cur].Name)
 					if *routes != "" {
 						for _, r := range strings.Split(*routes, ",") {
@@ -312,10 +440,10 @@ func cmdProxy(args []string) {
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodConnect {
-			handleCONNECT(w, r, *verbose)
+			handleCONNECT(w, r, *verbose, block, markActive)
 			return
 		}
-		handleHTTP(w, r, *verbose)
+		handleHTTP(w, r, *verbose, block, markActive)
 	})
 	srv := &http.Server{Addr: *listen, Handler: handler}
 	// Suppress per-request server error spam on hijacked conns.
@@ -360,6 +488,7 @@ func cmdList(args []string) {
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
 	peersPath := fs.String("peers", "peers.json", "peer pool JSON")
 	iface := fs.String("iface", "flare", "wireguard interface")
+	statsPath := fs.String("stats", "/tmp/wgtunnel-stats.json", "peer stats file")
 	fs.Parse(args)
 	peers, err := loadPeers(*peersPath)
 	if err != nil || len(peers) == 0 {
@@ -377,8 +506,15 @@ func cmdList(args []string) {
 		}
 	}
 	age := handshakeAge(*iface)
-	fmt.Printf("%-4s %-22s %-24s %s\n", "#", "NAME", "ENDPOINT", "STATUS")
+	stats := loadStats(*statsPath)
+	fmt.Printf("%-4s %-22s %-24s %-10s %-12s %s\n", "#", "NAME", "ENDPOINT", "REQUESTS", "TRANSFER", "STATUS")
 	for i, p := range peers {
+		pst := stats[p.Name]
+		reqs, xfer := "-", "-"
+		if pst != nil {
+			reqs = strconv.FormatInt(pst.Requests, 10)
+			xfer = fmt.Sprintf("↓%.1fMB ↑%.1fMB", float64(pst.RxBytes)/1048576, float64(pst.TxBytes)/1048576)
+		}
 		st := ""
 		if i == active {
 			if age >= 0 {
@@ -387,8 +523,62 @@ func cmdList(args []string) {
 				st = "⚠️  ACTIVE (no handshake yet)"
 			}
 		}
-		fmt.Printf("%-4d %-22s %-24s %s\n", i, p.Name, p.Endpoint, st)
+		fmt.Printf("%-4d %-22s %-24s %-10s %-12s %s\n", i, p.Name, p.Endpoint, reqs, xfer, st)
 	}
+}
+
+func cmdExport(args []string) {
+	fs := flag.NewFlagSet("export", flag.ExitOnError)
+	peersPath := fs.String("peers", "peers.json", "peer pool JSON")
+	output := fs.String("output", "peers-backup.json", "backup file")
+	fs.Parse(args)
+	data, err := os.ReadFile(*peersPath)
+	if err != nil {
+		fmt.Println("❌ read:", err)
+		os.Exit(1)
+	}
+	var peers []Peer
+	if err := json.Unmarshal(data, &peers); err != nil {
+		fmt.Println("❌ invalid peers.json:", err)
+		os.Exit(1)
+	}
+	if err := os.WriteFile(*output, data, 0600); err != nil {
+		fmt.Println("❌ write:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("✅ Exported %d peers to %s (keep it secret!)\n", len(peers), *output)
+}
+
+func cmdImport(args []string) {
+	fs := flag.NewFlagSet("import", flag.ExitOnError)
+	peersPath := fs.String("peers", "peers.json", "peer pool JSON")
+	input := fs.String("input", "", "backup file to import")
+	fs.Parse(args)
+	if *input == "" {
+		fmt.Println("❌ --input required")
+		os.Exit(1)
+	}
+	data, err := os.ReadFile(*input)
+	if err != nil {
+		fmt.Println("❌ read:", err)
+		os.Exit(1)
+	}
+	var peers []Peer
+	if err := json.Unmarshal(data, &peers); err != nil || len(peers) == 0 {
+		fmt.Println("❌ invalid backup (no peers)")
+		os.Exit(1)
+	}
+	for _, p := range peers {
+		if p.PrivateKey == "" || p.PublicKey == "" || p.Endpoint == "" {
+			fmt.Println("❌ invalid backup (peer missing keys/endpoint)")
+			os.Exit(1)
+		}
+	}
+	if err := os.WriteFile(*peersPath, data, 0600); err != nil {
+		fmt.Println("❌ write:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("✅ Imported %d peers into %s\n", len(peers), *peersPath)
 }
 
 // cmdTest checks exit IP per peer on a scratch interface (default wgtest)
@@ -505,7 +695,7 @@ func cmdStatus(args []string) {	fs := flag.NewFlagSet("status", flag.ExitOnError
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: wgtunnel <proxy|rotate|status|list|test> [options]")
+		fmt.Println("Usage: wgtunnel <proxy|rotate|status|list|test|export|import> [options]")
 		os.Exit(1)
 	}
 	switch os.Args[1] {
@@ -519,6 +709,10 @@ func main() {
 		cmdList(os.Args[2:])
 	case "test":
 		cmdTest(os.Args[2:])
+	case "export":
+		cmdExport(os.Args[2:])
+	case "import":
+		cmdImport(os.Args[2:])
 	default:
 		fmt.Println("Unknown command:", os.Args[1])
 		os.Exit(1)

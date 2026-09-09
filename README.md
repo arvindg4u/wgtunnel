@@ -36,12 +36,23 @@ cp peers.json.example peers.json   # fill in real keys (never commit!)
 
 ```sh
 ./wgtunnel proxy --peers peers.json --listen 127.0.0.1:8080 --interval 300 --verbose
+./wgtunnel proxy --peers peers.json --route opencode.ai,api.kilo.ai --blocklist blocklist.txt
 ./wgtunnel rotate --peers peers.json --iface flare   # switch to next healthy peer now
 ./wgtunnel status --iface flare                      # handshake / transfer info
 ./wgtunnel list --peers peers.json                   # all peers, active marked
 ./wgtunnel test --peers peers.json                   # exit IP per peer (scratch iface)
 ./wgtunnel test --peers peers.json --peer 4          # single peer only
+./wgtunnel export --output peers-backup.json         # backup (keep secret!)
+./wgtunnel import --input peers-backup.json          # restore
 ```
+
+`proxy` flags: `--route` re-applies policy routes every 15s (Android
+flushes them); `--blocklist` blocks telemetry/tracker domains with 403
+before they touch the VPN; `--interval 0` disables rotation.
+
+> ⚠️ Go slow: rotating or mass-testing too fast triggers server-side
+> session throttling (handshakes succeed, data stops). Prefer `--interval`
+> 1800s+ and test single peers with gaps.
 
 Proxy config for clients:
 

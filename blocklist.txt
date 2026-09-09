@@ -1,0 +1,23 @@
+# WGTunnel blocklist — one pattern per line, substring match on hostname.
+# Blocked requests get 403 without touching the VPN (saves bandwidth,
+# same idea as FlareTunnel's blacklist saving Worker requests).
+# Lines starting with # are comments. Empty lines ignored.
+
+# --- telemetry / analytics ---
+posthog.com
+segment.io
+mixpanel.com
+amplitude.com
+telemetry.
+analytics.
+tracking.
+events.kiloapps.io
+us.i.posthog.com
+oztamz.
+
+# --- ads / trackers ---
+doubleclick.net
+googlesyndication.com
+google-analytics.com
+adsystem.com
+adsrvr.org
