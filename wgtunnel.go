@@ -18,9 +18,11 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -252,6 +254,133 @@ func snapshotTransfer(iface, peerName string, m map[string]*PeerStats) {
 	}
 }
 
+// ---- Killswitch (fail-closed): routed destinations must never leak direct.
+// When VPN is unhealthy we point them at a prohibit route instead of
+// removing routes (absence would fall through to the direct tables).
+
+func setKillswitch(dsts []string, on bool, egress string) {
+	for _, d := range dsts {
+		d = strings.TrimSpace(d)
+		if strings.Contains(d, "/") {
+			if on {
+				sh("ip", "route", "replace", d, "prohibit")
+			} else {
+				sh("ip", "route", "replace", d, "dev", egress)
+			}
+			continue
+		}
+		// Hostname: expand each resolved IP.
+		if ips, err := net.LookupHost(d); err == nil {
+			for _, ip := range ips {
+				if strings.Contains(ip, ":") {
+					continue
+				}
+				setKillswitch([]string{ip + "/32"}, on, egress)
+			}
+		}
+	}
+}
+
+// vpnHealthy reports whether iface has a fresh handshake.
+func vpnHealthy(iface string) bool {
+	age := handshakeAge(iface)
+	return age >= 0 && age < 180
+}
+
+// backoff sleeps with exponential backoff + jitter.
+func backoff(attempt int) {
+	base := 5 << attempt // 5,10,20,40...
+	if base > 120 {
+		base = 120
+	}
+	jitter := time.Duration(500+time.Now().UnixNano()%1500) * time.Millisecond
+	time.Sleep(time.Duration(base)*time.Second + jitter)
+}
+
+// ---- DNS via tunnel ----
+// Proton exposes DNS at 10.2.0.1 inside the tunnel. Routing system DNS
+// there kills the last direct leak (plain lookups expose destinations).
+
+const resolvConf = "/etc/resolv.conf"
+const resolvBackup = "/tmp/resolv.conf.wgtunnel.bak"
+const vpnDNS = "10.2.0.1"
+
+func enableDNS(egress string) {
+	if _, err := os.Stat(resolvBackup); os.IsNotExist(err) {
+		if data, err := os.ReadFile(resolvConf); err == nil {
+			_ = os.WriteFile(resolvBackup, data, 0644)
+		}
+	}
+	_ = os.WriteFile(resolvConf, []byte("# managed by wgtunnel --dns\nnameserver "+vpnDNS+"\n"), 0644)
+	sh("ip", "route", "replace", vpnDNS+"/32", "dev", egress)
+	sh("ip", "rule", "add", "to", vpnDNS+"/32", "lookup", "main", "pref", "100")
+	fmt.Println("🔒 DNS via tunnel (" + vpnDNS + "), backup at " + resolvBackup)
+}
+
+func restoreDNS() {
+	if data, err := os.ReadFile(resolvBackup); err == nil {
+		_ = os.WriteFile(resolvConf, data, 0644)
+		fmt.Println("🔓 DNS restored from backup")
+	} else {
+		fmt.Println("⚠️  no DNS backup found, leaving resolv.conf as-is")
+	}
+}
+
+func cmdDNS(args []string) {
+	fs := flag.NewFlagSet("dns", flag.ExitOnError)
+	off := fs.Bool("off", false, "restore system DNS from backup")
+	egress := fs.String("iface", "flare", "wireguard interface carrying DNS")
+	fs.Parse(args)
+	if *off {
+		restoreDNS()
+		return
+	}
+	enableDNS(*egress)
+}
+
+// ---- Standby rotation (zero-downtime, throttle-friendly) ----
+
+// removePeer drops a peer from an interface (frees the server-side slot).
+func removePeer(iface, pubkey string) {
+	sh("wg", "set", iface, "peer", pubkey, "remove")
+}
+
+// rotateStandby brings the next peer up on the standby iface and verifies it.
+// Caller flips routes to the standby first, then drops the old peer.
+func rotateStandby(peers []Peer, cur int, standby string, timeout int, verbose bool) (int, error) {
+	n := len(peers)
+	for k := 1; k <= n; k++ {
+		next := (cur + k) % n
+		p := peers[next]
+		if verbose {
+			fmt.Printf("🔄 Warming standby peer [%d] %s on %s\n", next, p.Name, standby)
+		}
+		if err := applyPeer(standby, p); err != nil {
+			fmt.Printf("   ✗ apply failed: %v\n", err)
+			continue
+		}
+		ok := false
+		deadline := time.Now().Add(time.Duration(timeout) * time.Second)
+		for time.Now().Before(deadline) {
+			time.Sleep(2 * time.Second)
+			if age := handshakeAge(standby); age >= 0 && age < 120 {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			fmt.Printf("   ✗ peer [%d] no handshake, trying next\n", next)
+			continue
+		}
+		// Standby verified; caller flips routes, then drops old peer.
+		if verbose {
+			fmt.Printf("   ✅ peer [%d] %s warmed on %s\n", next, p.Name, standby)
+		}
+		return next, nil
+	}
+	return cur, fmt.Errorf("no healthy standby peer")
+}
+
 // ---- HTTP proxy (plain CONNECT passthrough, no MITM) ----
 
 var reqCount int64
@@ -345,13 +474,18 @@ func cmdProxy(args []string) {
 	peersPath := fs.String("peers", "peers.json", "peer pool JSON")
 	listen := fs.String("listen", "127.0.0.1:8080", "proxy listen address")
 	iface := fs.String("iface", "flare", "wireguard interface")
-	interval := fs.Int("interval", 300, "peer rotation seconds (0 = no rotation)")
+	interval := fs.Int("interval", 1800, "peer rotation seconds, 0 disables (min 600 recommended)")
 	timeout := fs.Int("timeout", 25, "handshake wait seconds per peer")
 	routes := fs.String("route", "", "comma-separated hosts/CIDRs to route via tunnel (re-applied every 60s)")
 	blocklist := fs.String("blocklist", "blocklist.txt", "domain blocklist file (empty to disable)")
 	statsPath := fs.String("stats", "/tmp/wgtunnel-stats.json", "peer stats file")
+	useDNS := fs.Bool("dns", false, "route system DNS via tunnel (rewrites resolv.conf, restores on exit)")
 	verbose := fs.Bool("verbose", false, "verbose logging")
 	fs.Parse(args)
+	if *interval > 0 && *interval < 600 {
+		fmt.Println("⚠️  interval < 600s risks server-side session throttling; using 600s")
+		*interval = 600
+	}
 
 	peers, err := loadPeers(*peersPath)
 	if err != nil || len(peers) == 0 {
@@ -359,10 +493,41 @@ func cmdProxy(args []string) {
 		os.Exit(1)
 	}
 	ensureDaemon(*iface)
+	standby := *iface + "2"
 	idx, err := activate(*iface, peers, 0, *timeout, *verbose)
 	if err != nil {
 		fmt.Println("❌", err)
 		os.Exit(1)
+	}
+	egress := *iface // interface currently carrying routed traffic
+	routed := []string{}
+	if *routes != "" {
+		for _, r := range strings.Split(*routes, ",") {
+			if r = strings.TrimSpace(r); r != "" {
+				routed = append(routed, r)
+			}
+		}
+	}
+	flipRoutes := func(dev string) {
+		for _, r := range routed {
+			ensureRoute(r, dev)
+		}
+		if *useDNS {
+			sh("ip", "route", "replace", vpnDNS+"/32", "dev", dev)
+		}
+	}
+	flipRoutes(egress)
+	if *useDNS {
+		enableDNS(egress)
+		// Restore system DNS on clean shutdown.
+		sigc := make(chan os.Signal, 1)
+		signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			<-sigc
+			fmt.Println("\n🛑 shutting down, restoring DNS...")
+			restoreDNS()
+			os.Exit(0)
+		}()
 	}
 	block := loadBlocklist(*blocklist)
 	stats := loadStats(*statsPath)
@@ -396,43 +561,66 @@ func cmdProxy(args []string) {
 	fmt.Printf("   HTTP Proxy:  %s\n", *listen)
 	fmt.Printf("   HTTPS Proxy: %s\n", *listen)
 
-	if *interval > 0 || *routes != "" {
+	if *interval > 0 || *routes != "" || true {
 		go func() {
 			cur := idx
+			failStreak := 0
 			// Re-apply routes frequently (Android netd flushes ip rules).
 			routeTick := time.NewTicker(15 * time.Second)
 			defer routeTick.Stop()
+			// Health monitor doubles as killswitch enforcer.
+			healthTick := time.NewTicker(30 * time.Second)
+			defer healthTick.Stop()
 			rotTick := time.NewTicker(time.Duration(*interval) * time.Second)
 			if *interval <= 0 {
 				rotTick.Stop()
 			} else {
 				defer rotTick.Stop()
 			}
+			// Jitter rotation start so restarts don't thunder.
+			time.Sleep(time.Duration(time.Now().UnixNano()%10) * time.Second)
 			for {
 				select {
 				case <-routeTick.C:
-					if *routes != "" {
-						for _, r := range strings.Split(*routes, ",") {
-							ensureRoute(strings.TrimSpace(r), *iface)
+					flipRoutes(egress)
+				case <-healthTick.C:
+					if vpnHealthy(egress) {
+						if failStreak > 0 && *verbose {
+							fmt.Println("✅ tunnel healthy again, killswitch off")
 						}
-					}
-				case <-rotTick.C:
-					snapshotTransfer(*iface, peers[cur].Name, stats)
-					saveStats(*statsPath, stats)
-					next, err := activate(*iface, peers, cur+1, *timeout, *verbose)
-					if err != nil {
-						fmt.Println("⚠️  rotation failed, keeping current peer:", err)
+						failStreak = 0
+						setKillswitch(routed, false, egress)
 						continue
 					}
+					failStreak++
+					fmt.Printf("⚠️  tunnel unhealthy (streak %d) — killswitch ON, re-activating\n", failStreak)
+					setKillswitch(routed, true, egress)
+					backoff(failStreak)
+					if next, err := activate(egress, peers, cur+1, *timeout, *verbose); err == nil {
+						cur = next
+						atomic.StoreInt64(&activeIdx, int64(cur))
+						markActive()
+					}
+				case <-rotTick.C:
+					ensureDaemon(standby)
+					next, err := rotateStandby(peers, cur, standby, *timeout, *verbose)
+					if err != nil {
+						fmt.Println("⚠️  rotation failed, keeping current peer:", err)
+						backoff(1)
+						continue
+					}
+					// Flip traffic to warmed standby, drop old peer, swap roles.
+					oldEgress, oldPeer := egress, cur
+					egress = standby
+					standby = oldEgress
+					flipRoutes(egress)
+					removePeer(standby, peers[oldPeer].PublicKey)
 					cur = next
 					atomic.StoreInt64(&activeIdx, int64(cur))
 					markActive()
-					fmt.Printf("🔄 Rotated to peer [%d] %s\n", cur, peers[cur].Name)
-					if *routes != "" {
-						for _, r := range strings.Split(*routes, ",") {
-							ensureRoute(strings.TrimSpace(r), *iface)
-						}
-					}
+					snapshotTransfer(egress, peers[cur].Name, stats)
+					saveStats(*statsPath, stats)
+					fmt.Printf("🔄 Rotated to peer [%d] %s (egress %s)\n", cur, peers[cur].Name, egress)
 				}
 			}
 		}()
@@ -695,7 +883,7 @@ func cmdStatus(args []string) {	fs := flag.NewFlagSet("status", flag.ExitOnError
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: wgtunnel <proxy|rotate|status|list|test|export|import> [options]")
+		fmt.Println("Usage: wgtunnel <proxy|rotate|status|list|test|export|import|dns> [options]")
 		os.Exit(1)
 	}
 	switch os.Args[1] {
@@ -713,6 +901,8 @@ func main() {
 		cmdExport(os.Args[2:])
 	case "import":
 		cmdImport(os.Args[2:])
+	case "dns":
+		cmdDNS(os.Args[2:])
 	default:
 		fmt.Println("Unknown command:", os.Args[1])
 		os.Exit(1)
