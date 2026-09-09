@@ -1,0 +1,8 @@
+# Build output
+wgtunnel
+*.log
+
+# Real peer keys - NEVER commit
+peers.json
+*.conf
+!/peers.json.example
