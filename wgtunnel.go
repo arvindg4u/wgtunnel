@@ -471,13 +471,13 @@ func handleHTTP(w http.ResponseWriter, r *http.Request, verbose bool, block []st
 
 func cmdProxy(args []string) {
 	fs := flag.NewFlagSet("proxy", flag.ExitOnError)
-	peersPath := fs.String("peers", "peers.json", "peer pool JSON")
+	peersPath := fs.String("peers", "/root/wgtunnel/peers.json", "peer pool JSON")
 	listen := fs.String("listen", "127.0.0.1:8080", "proxy listen address")
 	iface := fs.String("iface", "flare", "wireguard interface")
 	interval := fs.Int("interval", 1800, "peer rotation seconds, 0 disables (min 600 recommended)")
 	timeout := fs.Int("timeout", 25, "handshake wait seconds per peer")
 	routes := fs.String("route", "", "comma-separated hosts/CIDRs to route via tunnel (re-applied every 60s)")
-	blocklist := fs.String("blocklist", "blocklist.txt", "domain blocklist file (empty to disable)")
+	blocklist := fs.String("blocklist", "/root/wgtunnel/blocklist.txt", "domain blocklist file (empty to disable)")
 	statsPath := fs.String("stats", "/tmp/wgtunnel-stats.json", "peer stats file")
 	useDNS := fs.Bool("dns", false, "route system DNS via tunnel (rewrites resolv.conf, restores on exit)")
 	verbose := fs.Bool("verbose", false, "verbose logging")
@@ -643,7 +643,7 @@ func cmdProxy(args []string) {
 
 func cmdRotate(args []string) {
 	fs := flag.NewFlagSet("rotate", flag.ExitOnError)
-	peersPath := fs.String("peers", "peers.json", "peer pool JSON")
+	peersPath := fs.String("peers", "/root/wgtunnel/peers.json", "peer pool JSON")
 	iface := fs.String("iface", "flare", "wireguard interface")
 	timeout := fs.Int("timeout", 25, "handshake wait seconds per peer")
 	verbose := fs.Bool("verbose", true, "verbose logging")
@@ -674,7 +674,7 @@ func cmdRotate(args []string) {
 
 func cmdList(args []string) {
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
-	peersPath := fs.String("peers", "peers.json", "peer pool JSON")
+	peersPath := fs.String("peers", "/root/wgtunnel/peers.json", "peer pool JSON")
 	iface := fs.String("iface", "flare", "wireguard interface")
 	statsPath := fs.String("stats", "/tmp/wgtunnel-stats.json", "peer stats file")
 	fs.Parse(args)
@@ -717,7 +717,7 @@ func cmdList(args []string) {
 
 func cmdExport(args []string) {
 	fs := flag.NewFlagSet("export", flag.ExitOnError)
-	peersPath := fs.String("peers", "peers.json", "peer pool JSON")
+	peersPath := fs.String("peers", "/root/wgtunnel/peers.json", "peer pool JSON")
 	output := fs.String("output", "peers-backup.json", "backup file")
 	fs.Parse(args)
 	data, err := os.ReadFile(*peersPath)
@@ -739,7 +739,7 @@ func cmdExport(args []string) {
 
 func cmdImport(args []string) {
 	fs := flag.NewFlagSet("import", flag.ExitOnError)
-	peersPath := fs.String("peers", "peers.json", "peer pool JSON")
+	peersPath := fs.String("peers", "/root/wgtunnel/peers.json", "peer pool JSON")
 	input := fs.String("input", "", "backup file to import")
 	fs.Parse(args)
 	if *input == "" {
@@ -773,7 +773,7 @@ func cmdImport(args []string) {
 // without touching the live proxy interface. Restores test routes after.
 func cmdTest(args []string) {
 	fs := flag.NewFlagSet("test", flag.ExitOnError)
-	peersPath := fs.String("peers", "peers.json", "peer pool JSON")
+	peersPath := fs.String("peers", "/root/wgtunnel/peers.json", "peer pool JSON")
 	iface := fs.String("iface", "wgtest", "scratch wireguard interface")
 	peerIdx := fs.Int("peer", -1, "test single peer index (default: all)")
 	delay := fs.Int("delay", 8, "seconds between peers (avoids server-side session throttling)")
