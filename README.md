@@ -38,6 +38,9 @@ cp peers.json.example peers.json   # fill in real keys (never commit!)
 ./wgtunnel proxy --peers peers.json --listen 127.0.0.1:8080 --interval 300 --verbose
 ./wgtunnel rotate --peers peers.json --iface flare   # switch to next healthy peer now
 ./wgtunnel status --iface flare                      # handshake / transfer info
+./wgtunnel list --peers peers.json                   # all peers, active marked
+./wgtunnel test --peers peers.json                   # exit IP per peer (scratch iface)
+./wgtunnel test --peers peers.json --peer 4          # single peer only
 ```
 
 Proxy config for clients:
