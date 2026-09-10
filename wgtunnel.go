@@ -923,6 +923,15 @@ func cmdProxy(args []string) {
 	fmt.Println("📝 Proxy Configuration:")
 	fmt.Printf("   HTTP Proxy:  %s\n", *listen)
 	fmt.Printf("   HTTPS Proxy: %s\n", *listen)
+	fmt.Println("📻 SIGUSR1 (kill -USR1 <pid>) forces immediate rotation (e.g. on API 429)")
+
+	// External rotate trigger: `kill -USR1 <proxy-pid>` forces immediate
+	// rotation to the next healthy peer. Used for app-level rate limits
+	// (e.g. opencode.ai HTTP 429 FreeUsageLimitError) which the CONNECT
+	// passthrough cannot see inside TLS — an outside watcher detects the
+	// 429 and signals the proxy.
+	sigRotate := make(chan os.Signal, 1)
+	signal.Notify(sigRotate, syscall.SIGUSR1)
 
 	if *interval > 0 || *routes != "" || true {
 		go func() {
@@ -980,12 +989,51 @@ func cmdProxy(args []string) {
 					atomic.StoreInt64(&dialFailCount, 0)
 				}
 			}
+			// Shared rotation path: warm standby, flip egress, drop old peer.
+			// markFail=true records the current peer as rate-limited/failed
+			// so cooldown skips it on the next pick.
+			doRotate := func(reason string, markFail bool) {
+				if markFail {
+					fmt.Printf("📻 rotate trigger (%s) — marking [%d] %s rate-limited\n", reason, cur, peers[cur].Name)
+					recordFail(peers[cur].Name, reason)
+				} else if *verbose {
+					fmt.Printf("🔄 interval rotation from [%d] %s\n", cur, peers[cur].Name)
+				}
+				if err := ensureDaemon(standby); err != nil {
+					fmt.Println("⚠️  standby daemon:", err)
+					backoff(1)
+					return
+				}
+				next, err := rotateStandby(peers, cur, standby, *timeout, *verbose, stats)
+				if err != nil {
+					fmt.Println("⚠️  rotation failed, keeping current peer:", err)
+					backoff(1)
+					return
+				}
+				// Credit the OLD peer's final delta before flipping, or
+				// its traffic gets attributed to the new peer.
+				snapshotTransfer(tr, egress, peers[cur].Name, stats)
+				// Flip traffic to warmed standby, drop old peer, swap roles.
+				oldEgress, oldPeer := egress, cur
+				egress = standby
+				standby = oldEgress
+				flipRoutes(egress)
+				removePeer(standby, peers[oldPeer].PublicKey)
+				cur = next
+				atomic.StoreInt64(&activeIdx, int64(cur))
+				markActive()
+				tr.reset(egress)
+				saveStats(*statsPath, stats)
+				fmt.Printf("🔄 Rotated to peer [%d] %s (egress %s, reason: %s)\n", cur, peers[cur].Name, egress, reason)
+			}
 			// Jitter rotation start so restarts don't thunder.
 			time.Sleep(time.Duration(time.Now().UnixNano()%10) * time.Second)
 			for {
 				select {
 				case <-routeTick.C:
 					flipRoutes(egress)
+				case <-sigRotate:
+					doRotate("429/manual SIGUSR1", true)
 				case <-healthTick.C:
 					// Signal 1: consecutive upstream dial failures =
 					// blackhole even with a fresh handshake. React now,
@@ -1024,32 +1072,7 @@ func cmdProxy(args []string) {
 					}
 					failover("stale handshake")
 				case <-rotTick.C:
-					if err := ensureDaemon(standby); err != nil {
-						fmt.Println("⚠️  standby daemon:", err)
-						backoff(1)
-						continue
-					}
-					next, err := rotateStandby(peers, cur, standby, *timeout, *verbose, stats)
-					if err != nil {
-						fmt.Println("⚠️  rotation failed, keeping current peer:", err)
-						backoff(1)
-						continue
-					}
-					// Credit the OLD peer's final delta before flipping, or
-					// its traffic gets attributed to the new peer.
-					snapshotTransfer(tr, egress, peers[cur].Name, stats)
-					// Flip traffic to warmed standby, drop old peer, swap roles.
-					oldEgress, oldPeer := egress, cur
-					egress = standby
-					standby = oldEgress
-					flipRoutes(egress)
-					removePeer(standby, peers[oldPeer].PublicKey)
-					cur = next
-					atomic.StoreInt64(&activeIdx, int64(cur))
-					markActive()
-					tr.reset(egress)
-					saveStats(*statsPath, stats)
-					fmt.Printf("🔄 Rotated to peer [%d] %s (egress %s)\n", cur, peers[cur].Name, egress)
+					doRotate("interval", false)
 				}
 			}
 		}()
