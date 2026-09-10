@@ -872,6 +872,14 @@ func cmdProxy(args []string) {
 		fmt.Println("❌ load peers:", err)
 		os.Exit(1)
 	}
+	// Arm the rotate-signal channel BEFORE activation: a SIGUSR1 arriving
+	// during the (slow) first activation must not kill the process with the
+	// default disposition. Early signals are dropped after activation.
+	sigRotate := make(chan os.Signal, 1)
+	signal.Notify(sigRotate, syscall.SIGUSR1)
+	// Dashboard rotate button (POST /api/rotate) feeds the same path.
+	rotateHTTP := make(chan string, 1)
+	proxyStart := time.Now()
 	if err := ensureDaemon(*iface); err != nil {
 		fmt.Println("❌", err)
 		os.Exit(1)
@@ -950,13 +958,12 @@ func cmdProxy(args []string) {
 	fmt.Printf("   HTTPS Proxy: %s\n", *listen)
 	fmt.Println("📻 SIGUSR1 (kill -USR1 <pid>) forces immediate rotation (e.g. on API 429)")
 
-	// External rotate trigger: `kill -USR1 <proxy-pid>` forces immediate
-	// rotation to the next healthy peer. Used for app-level rate limits
-	// (e.g. opencode.ai HTTP 429 FreeUsageLimitError) which the CONNECT
-	// passthrough cannot see inside TLS — an outside watcher detects the
-	// 429 and signals the proxy.
-	sigRotate := make(chan os.Signal, 1)
-	signal.Notify(sigRotate, syscall.SIGUSR1)
+	// Drop any rotate signals that arrived during activation.
+	select {
+	case <-sigRotate:
+		fmt.Println("📻 dropped early rotate signal from startup")
+	default:
+	}
 
 	if *interval > 0 || *routes != "" || true {
 		go func() {
@@ -1059,6 +1066,8 @@ func cmdProxy(args []string) {
 					flipRoutes(egress)
 				case <-sigRotate:
 					doRotate("429/manual SIGUSR1", true)
+				case reason := <-rotateHTTP:
+					doRotate(reason, true)
 				case <-healthTick.C:
 					// Signal 1: consecutive upstream dial failures =
 					// blackhole even with a fresh handshake. React now,
@@ -1103,9 +1112,63 @@ func cmdProxy(args []string) {
 		}()
 	}
 
+	isDashHost := func(host string) bool {
+		if host == *listen {
+			return true
+		}
+		if strings.HasPrefix(*listen, "127.0.0.1:") && host == "localhost"+strings.TrimPrefix(*listen, "127.0.0.1") {
+			return true
+		}
+		return false
+	}
+	dashServe := func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/" && (r.Method == "GET" || r.Method == "HEAD"):
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(dashHTML))
+		case r.URL.Path == "/api/status" && r.Method == "GET":
+			_, st := dashSnapshot(peers, *iface, *statsPath)
+			st.IntervalS = *interval
+			st.UptimeS = int64(time.Since(proxyStart).Seconds())
+			st.Routes = *routes
+			st.Listen = *listen
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(st)
+		case r.URL.Path == "/api/peers" && r.Method == "GET":
+			list, _ := dashSnapshot(peers, *iface, *statsPath)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(list)
+		case r.URL.Path == "/api/log" && r.Method == "GET":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string][]string{"lines": dashLogTail("/tmp/wgtunnel.log", 40)})
+		case r.URL.Path == "/api/rotate" && r.Method == "POST":
+			select {
+			case rotateHTTP <- "dashboard":
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"ok":true}`))
+			default:
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(`{"ok":false,"error":"rotation already in progress"}`))
+			}
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}
+
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodConnect {
 			handleCONNECT(w, r, *verbose, block, markActive)
+			return
+		}
+		// Browser aimed directly at the proxy listener -> dashboard.
+		if r.URL.Host == "" && isDashHost(r.Host) {
+			dashServe(w, r)
+			return
+		}
+		// Absolute-URI request targeting ourselves (proxy loop) -> refuse.
+		if r.URL.Host != "" && isDashHost(r.URL.Host) {
+			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
 		handleHTTP(w, r, *verbose, block, markActive)
@@ -1119,6 +1182,234 @@ func cmdProxy(args []string) {
 		fmt.Println("server stopped:", err)
 	}
 }
+
+// ---- Dashboard (same port as the proxy) ----
+// Browser traffic aimed directly at the proxy listener (origin-form request
+// with Host == listen addr) gets the dashboard + JSON API. CONNECT and
+// absolute-URI proxy traffic are untouched. Everything is inline (no CDN,
+// no external fonts) so it works offline from a single binary.
+
+type dashPeer struct {
+	Index      int     `json:"index"`
+	Name       string  `json:"name"`
+	Endpoint   string  `json:"endpoint"`
+	Requests   int64   `json:"requests"`
+	Today      int64   `json:"today"`
+	LastDay    int64   `json:"last_day"`
+	RxMB       float64 `json:"rx_mb"`
+	TxMB       float64 `json:"tx_mb"`
+	Status     string  `json:"status"`
+	Active     bool    `json:"active"`
+	Iface      string  `json:"iface"`
+	HandshakeS int64   `json:"handshake_s"`
+}
+
+type dashStatus struct {
+	ActivePeer     string  `json:"active_peer"`
+	ActiveEndpoint string  `json:"active_endpoint"`
+	Iface          string  `json:"iface"`
+	HandshakeS     int64   `json:"handshake_s"`
+	ReqTotal       int64   `json:"req_total"`
+	ReqToday       int64   `json:"req_today"`
+	RxMB           float64 `json:"rx_mb"`
+	TxMB           float64 `json:"tx_mb"`
+	Peers          int     `json:"peers"`
+	Cooldowns      int     `json:"cooldowns"`
+	IntervalS      int     `json:"interval_s"`
+	UptimeS        int64   `json:"uptime_s"`
+	Routes         string  `json:"routes"`
+	Listen         string  `json:"listen"`
+}
+
+// dashSnapshot reads the stats FILE (like `list` does), so dashboard polling
+// never races the proxy's in-memory map.
+func dashSnapshot(peers []Peer, iface, statsPath string) ([]dashPeer, dashStatus) {
+	stats := loadStats(statsPath)
+	ifaces := liveIfaces(iface)
+	active, activeIface, age := -1, "", int64(-1)
+	for _, ifname := range ifaces {
+		dump, err := sh("wg", "show", ifname, "endpoints")
+		if err != nil {
+			continue
+		}
+		for i, p := range peers {
+			if strings.Contains(dump, p.Endpoint) {
+				if activeIface == "" || egressIface(ifname) {
+					active, activeIface = i, ifname
+					age = handshakeAge(ifname)
+				}
+				break
+			}
+		}
+	}
+	today := istToday()
+	var st dashStatus
+	st.Peers = len(peers)
+	out := make([]dashPeer, 0, len(peers))
+	for i, p := range peers {
+		dp := dashPeer{Index: i, Name: p.Name, Endpoint: p.Endpoint, HandshakeS: -1}
+		if pst := stats[p.Name]; pst != nil {
+			dp.Requests = pst.Requests
+			dr, lr := pst.DayRequests, pst.LastDayRequests
+			if pst.Day != "" && pst.Day != today {
+				lr, dr = dr, 0
+			}
+			dp.Today, dp.LastDay = dr, lr
+			dp.RxMB = float64(pst.RxBytes) / 1048576
+			dp.TxMB = float64(pst.TxBytes) / 1048576
+			if skip, left := peerCooldown(stats, p.Name); skip {
+				dp.Status = "cooldown " + left
+				st.Cooldowns++
+			}
+		}
+		if i == active {
+			dp.Active = true
+			dp.Iface = activeIface
+			dp.HandshakeS = age
+			dp.Status = "active"
+			if age < 0 {
+				dp.Status = "warming"
+			}
+			st.ActivePeer, st.ActiveEndpoint = p.Name, p.Endpoint
+			st.Iface, st.HandshakeS = activeIface, age
+		}
+		st.ReqTotal += dp.Requests
+		st.ReqToday += dp.Today
+		st.RxMB += dp.RxMB
+		st.TxMB += dp.TxMB
+		out = append(out, dp)
+	}
+	return out, st
+}
+
+func dashLogTail(path string, maxLines int) []string {
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) == 0 {
+		return []string{}
+	}
+	if len(data) > 131072 {
+		data = data[len(data)-131072:]
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	return lines
+}
+
+const dashHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WGTunnel Dashboard</title>
+<style>
+:root{--bg:#0b1020;--card:#141b33;--line:#232c4d;--txt:#e8ecf8;--dim:#8b94b3;--acc:#5b8cff;--ok:#34d399;--warn:#fbbf24;--bad:#f87171}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:radial-gradient(1200px 600px at 20% -10%,#1b2450 0%,var(--bg) 55%) fixed,var(--bg);color:var(--txt);font:14px/1.5 -apple-system,'Segoe UI',Roboto,Inter,Arial,sans-serif;padding:24px;max-width:1100px;margin:0 auto}
+header{display:flex;align-items:center;gap:12px;margin-bottom:20px}
+.logo{width:40px;height:40px;border-radius:12px;background:linear-gradient(135deg,#5b8cff,#9d6bff);display:flex;align-items:center;justify-content:center;font-size:20px;box-shadow:0 4px 20px rgba(91,140,255,.4)}
+h1{font-size:22px;font-weight:700}
+.sub{color:var(--dim);font-size:12px}
+.pill{margin-left:auto;padding:5px 14px;border-radius:99px;font-size:12px;font-weight:600;background:rgba(52,211,153,.12);color:var(--ok);border:1px solid rgba(52,211,153,.35)}
+.pill.down{background:rgba(248,113,113,.12);color:var(--bad);border-color:rgba(248,113,113,.35)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px}
+.card{background:linear-gradient(180deg,rgba(255,255,255,.03),transparent),var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 16px}
+.card .k{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)}
+.card .v{font-size:22px;font-weight:700;margin-top:4px}
+.card .u{font-size:12px;color:var(--dim);font-weight:400}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:20px}
+.panel h2{font-size:14px;margin-bottom:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.08em}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;color:var(--dim);font-weight:600;padding:8px;border-bottom:1px solid var(--line);font-size:11px;text-transform:uppercase;letter-spacing:.06em}
+td{padding:8px;border-bottom:1px solid rgba(35,44,77,.5)}
+tr.active td{background:rgba(91,140,255,.08)}
+tr:last-child td{border-bottom:none}
+.badge{padding:2px 10px;border-radius:99px;font-size:11px;font-weight:600}
+.badge.active{background:rgba(52,211,153,.15);color:var(--ok)}
+.badge.cool{background:rgba(251,191,36,.15);color:var(--warn)}
+.badge.idle{background:rgba(139,148,179,.15);color:var(--dim)}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+button{background:linear-gradient(135deg,#5b8cff,#7a5cff);border:none;color:#fff;font-weight:600;padding:10px 22px;border-radius:10px;cursor:pointer;font-size:14px;box-shadow:0 4px 16px rgba(91,140,255,.35)}
+button:hover{filter:brightness(1.12)}
+button:disabled{opacity:.5;cursor:wait}
+#msg{font-size:13px;color:var(--dim)}
+pre{background:#0a0e1c;border:1px solid var(--line);border-radius:10px;padding:12px;font-size:12px;max-height:260px;overflow:auto;white-space:pre-wrap;color:#b9c2e2}
+.routes{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:var(--dim)}
+footer{text-align:center;color:var(--dim);font-size:12px;margin-top:8px}
+</style>
+</head>
+<body>
+<header>
+<div class="logo">&#128737;</div>
+<div><h1>WGTunnel</h1><div class="sub" id="sub">rotating WireGuard peer pool</div></div>
+<div class="pill" id="pill">checking…</div>
+</header>
+<div class="grid" id="cards"></div>
+<div class="panel"><h2>Peers</h2><div style="overflow-x:auto"><table>
+<thead><tr><th>#</th><th>Name</th><th>Endpoint</th><th>Total</th><th>Today</th><th>Yday</th><th>Transfer</th><th>Status</th></tr></thead>
+<tbody id="peers"></tbody>
+</table></div></div>
+<div class="panel"><h2>Control</h2><div class="row">
+<button id="rot" onclick="rotate()">&#128260; Rotate now</button>
+<span id="msg"></span>
+</div><div style="margin-top:10px" class="routes" id="routes"></div></div>
+<div class="panel"><h2>Live log</h2><pre id="log">loading…</pre></div>
+<footer>wgtunnel dashboard &middot; auto-refresh 3s &middot; localhost only</footer>
+<script>
+var busy=false;
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')}
+function fmtUptime(s){s=Math.floor(s);var h=Math.floor(s/3600),m=Math.floor(s%3600/60);if(h>0)return h+'h '+m+'m';if(m>0)return m+'m '+Math.floor(s%60)+'s';return s+'s'}
+function badge(p){
+  if(p.active)return '<span class="badge active">active'+(p.iface?' &middot; '+esc(p.iface):'')+'</span>';
+  if(p.status&&p.status.indexOf('cooldown')===0)return '<span class="badge cool">'+esc(p.status)+'</span>';
+  return '<span class="badge idle">standby</span>';
+}
+function card(k,v,u){return '<div class="card"><div class="k">'+k+'</div><div class="v">'+v+' <span class="u">'+u+'</span></div></div>'}
+async function refresh(){
+  try{
+    var r=await fetch('/api/status');if(!r.ok)throw 0;var s=await r.json();
+    var pill=document.getElementById('pill');
+    var ok=s.handshake_s>=0&&s.handshake_s<180;
+    pill.textContent=ok?'● tunnel up':'● tunnel down';
+    pill.className='pill'+(ok?'':' down');
+    document.getElementById('sub').textContent='peer '+esc(s.active_peer||'?')+' on '+esc(s.iface||'?')+' · '+esc(s.listen||'');
+    document.getElementById('cards').innerHTML=
+      card('Active peer',esc(s.active_peer||'—'),esc(s.active_endpoint||''))+
+      card('Handshake',s.handshake_s>=0?s.handshake_s+'s':'never','ago')+
+      card('Requests today',s.req_today,'/ total '+s.req_total)+
+      card('Transfer today','&#8595;'+s.rx_mb.toFixed(1)+' &#8593;'+s.tx_mb.toFixed(1),'MB')+
+      card('Uptime',fmtUptime(s.uptime_s),'')+
+      card('Rotation','every '+s.interval_s+'s',s.cooldowns+' cooling');
+    document.getElementById('routes').textContent='routed: '+(s.routes||'(none)')+' · '+s.peers+' peers';
+    var r2=await fetch('/api/peers');var peers=await r2.json();
+    var html='';
+    for(var i=0;i<peers.length;i++){var p=peers[i];
+      html+='<tr'+(p.active?' class="active"':'')+'><td>'+p.index+'</td><td>'+esc(p.name)+'</td><td>'+esc(p.endpoint)+'</td><td>'+p.requests+'</td><td>'+p.today+'</td><td>'+p.last_day+'</td><td>&#8595;'+p.rx_mb.toFixed(1)+' &#8593;'+p.tx_mb.toFixed(1)+' MB</td><td>'+badge(p)+'</td></tr>';
+    }
+    document.getElementById('peers').innerHTML=html;
+    var r3=await fetch('/api/log');var lg=await r3.json();
+    document.getElementById('log').textContent=lg.lines.join('\n')||'(empty)';
+  }catch(e){
+    document.getElementById('pill').textContent='● unreachable';
+    document.getElementById('pill').className='pill down';
+  }
+}
+async function rotate(){
+  if(busy)return;busy=true;
+  var b=document.getElementById('rot');b.disabled=true;
+  document.getElementById('msg').textContent='rotating…';
+  try{
+    var r=await fetch('/api/rotate',{method:'POST'});
+    var j=await r.json();
+    document.getElementById('msg').textContent=j.ok?'rotation started — warming standby peer':'busy: '+j.error;
+  }catch(e){document.getElementById('msg').textContent='request failed';}
+  setTimeout(function(){busy=false;b.disabled=false;refresh();},4000);
+}
+refresh();setInterval(refresh,3000);
+</script>
+</body>
+</html>`
 
 func cmdRotate(args []string) {
 	fs := flag.NewFlagSet("rotate", flag.ExitOnError)
