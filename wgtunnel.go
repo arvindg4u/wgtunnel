@@ -338,12 +338,35 @@ func blocked(host string, list []string) bool {
 // ---- Peer stats (persisted) ----
 
 type PeerStats struct {
-	Requests   int64  `json:"requests"`
-	LastActive string `json:"last_active"`
-	RxBytes    uint64 `json:"rx_bytes"`
-	TxBytes    uint64 `json:"tx_bytes"`
-	DialFails  int64  `json:"dial_fails"`
-	LastFail   string `json:"last_fail,omitempty"`
+	Requests        int64  `json:"requests"`
+	LastActive      string `json:"last_active"`
+	RxBytes         uint64 `json:"rx_bytes"`
+	TxBytes         uint64 `json:"tx_bytes"`
+	DialFails       int64  `json:"dial_fails"`
+	LastFail        string `json:"last_fail,omitempty"`
+	Day             string `json:"day,omitempty"` // IST date bucket YYYY-MM-DD
+	DayRequests     int64  `json:"day_requests"`
+	LastDayRequests int64  `json:"last_day_requests"`
+}
+
+// istZone is Asia/Kolkata without loading tzdata (fixed +05:30).
+var istZone = time.FixedZone("IST", 5*3600+1800)
+
+func istToday() string { return time.Now().In(istZone).Format("2006-01-02") }
+
+// rollDay moves a stale day bucket into LastDayRequests. Called on every
+// counted request so idle days still roll on next activity (no ticker needed).
+func rollDay(st *PeerStats) {
+	today := istToday()
+	if st.Day == "" {
+		st.Day = today
+		return
+	}
+	if st.Day != today {
+		st.LastDayRequests = st.DayRequests
+		st.DayRequests = 0
+		st.Day = today
+	}
 }
 
 func loadStats(path string) map[string]*PeerStats {
@@ -903,6 +926,8 @@ func cmdProxy(args []string) {
 			stats[peers[i].Name] = st
 		}
 		st.Requests++
+		rollDay(st)
+		st.DayRequests++
 		st.LastActive = time.Now().UTC().Format(time.RFC3339)
 		saveStats(*statsPath, stats)
 	}
@@ -1163,12 +1188,20 @@ func cmdList(args []string) {
 		}
 	}
 	stats := loadStats(*statsPath)
-	fmt.Printf("%-4s %-22s %-24s %-10s %-22s %s\n", "#", "NAME", "ENDPOINT", "REQUESTS", "TRANSFER", "STATUS")
+	fmt.Printf("%-4s %-22s %-24s %-10s %-10s %-10s %-22s %s\n", "#", "NAME", "ENDPOINT", "REQUESTS", "TODAY(IST)", "LASTDAY", "TRANSFER", "STATUS")
 	for i, p := range peers {
 		pst := stats[p.Name]
-		reqs, xfer := "-", "-"
+		reqs, today, lastday, xfer := "-", "-", "-", "-"
 		if pst != nil {
 			reqs = strconv.FormatInt(pst.Requests, 10)
+			// Show live day bucket; roll display-only so `list` never
+			// shows yesterday's count as today.
+			dr, lr := pst.DayRequests, pst.LastDayRequests
+			if pst.Day != "" && pst.Day != istToday() {
+				lr, dr = dr, 0
+			}
+			today = strconv.FormatInt(dr, 10)
+			lastday = strconv.FormatInt(lr, 10)
 			xfer = fmt.Sprintf("↓%.1fMB ↑%.1fMB", float64(pst.RxBytes)/1048576, float64(pst.TxBytes)/1048576)
 		}
 		st := ""
@@ -1183,7 +1216,7 @@ func cmdList(args []string) {
 				st = fmt.Sprintf("⚠️  ACTIVE on %s (no handshake yet)", activeIface)
 			}
 		}
-		fmt.Printf("%-4d %-22s %-24s %-10s %-22s %s\n", i, p.Name, p.Endpoint, reqs, xfer, st)
+		fmt.Printf("%-4d %-22s %-24s %-10s %-10s %-10s %-22s %s\n", i, p.Name, p.Endpoint, reqs, today, lastday, xfer, st)
 	}
 }
 
