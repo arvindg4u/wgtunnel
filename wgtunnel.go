@@ -1058,17 +1058,28 @@ func cmdList(args []string) {
 		fmt.Println("❌ load peers:", err)
 		os.Exit(1)
 	}
-	// Detect active peer by matching the configured endpoint.
+	// Detect active peer across all live flare ifaces (egress alternates
+	// between flare/flare2 on rotation; checking one misses the live one).
+	ifaces := liveIfaces(*iface)
 	active := -1
-	if dump, err := sh("wg", "show", *iface, "endpoints"); err == nil {
+	activeIface := ""
+	var age int64 = -1
+	for _, ifname := range ifaces {
+		dump, err := sh("wg", "show", ifname, "endpoints")
+		if err != nil {
+			continue
+		}
 		for i, p := range peers {
 			if strings.Contains(dump, p.Endpoint) {
-				active = i
+				// Prefer the iface actually carrying routed traffic.
+				if activeIface == "" || egressIface(ifname) {
+					active, activeIface = i, ifname
+					age = handshakeAge(ifname)
+				}
 				break
 			}
 		}
 	}
-	age := handshakeAge(*iface)
 	stats := loadStats(*statsPath)
 	fmt.Printf("%-4s %-22s %-24s %-10s %-22s %s\n", "#", "NAME", "ENDPOINT", "REQUESTS", "TRANSFER", "STATUS")
 	for i, p := range peers {
@@ -1085,9 +1096,9 @@ func cmdList(args []string) {
 		}
 		if i == active {
 			if age >= 0 {
-				st = fmt.Sprintf("✅ ACTIVE (handshake %ds ago)", age)
+				st = fmt.Sprintf("✅ ACTIVE on %s (handshake %ds ago)", activeIface, age)
 			} else {
-				st = "⚠️  ACTIVE (no handshake yet)"
+				st = fmt.Sprintf("⚠️  ACTIVE on %s (no handshake yet)", activeIface)
 			}
 		}
 		fmt.Printf("%-4d %-22s %-24s %-10s %-22s %s\n", i, p.Name, p.Endpoint, reqs, xfer, st)
@@ -1236,27 +1247,84 @@ func cmdTest(args []string) {
 	}
 }
 
-func cmdStatus(args []string) {	fs := flag.NewFlagSet("status", flag.ExitOnError)
-	iface := fs.String("iface", "flare", "wireguard interface")
-	fs.Parse(args)
-	out, err := sh("wg", "show", *iface)
+// egressIface reports whether kernel routes opencode.ai via ifname.
+// Used to pick the traffic-carrying interface when several are up.
+func egressIface(ifname string) bool {
+	out, err := sh("ip", "route", "get", "172.65.90.22")
 	if err != nil {
-		fmt.Println("interface down:", err)
-		os.Exit(1)
+		return false
 	}
-	scanner := bufio.NewScanner(strings.NewReader(out))
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.Contains(line, "private key") {
-			fmt.Println("  private key: (hidden)")
+	return strings.Contains(out, "dev "+ifname)
+}
+
+// liveIfaces returns flare-family interfaces that exist, defaulting to
+// the requested one when nothing else is up.
+func liveIfaces(want string) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(name string) {
+		if name == "" || seen[name] {
+			return
+		}
+		if _, err := sh("wg", "show", name, "endpoints"); err != nil {
+			return
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	add(want)
+	// The proxy alternates egress between flare and flare2 on rotation.
+	for _, alt := range []string{"flare", "flare2"} {
+		add(alt)
+	}
+	if len(out) == 0 {
+		return []string{want}
+	}
+	return out
+}
+
+func cmdStatus(args []string) {
+	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	iface := fs.String("iface", "flare", "wireguard interface (default shows all live flare ifaces)")
+	fs.Parse(args)
+	// Was --iface explicitly passed? If so, honor exactly that.
+	explicit := false
+	for _, a := range args {
+		if strings.HasPrefix(a, "--iface") || strings.HasPrefix(a, "-iface") {
+			explicit = true
+			break
+		}
+	}
+	ifaces := []string{*iface}
+	if !explicit {
+		ifaces = liveIfaces(*iface)
+	}
+	for n, ifname := range ifaces {
+		if len(ifaces) > 1 && n > 0 {
+			fmt.Println()
+		}
+		if len(ifaces) > 1 {
+			fmt.Printf("── %s ──\n", ifname)
+		}
+		out, err := sh("wg", "show", ifname)
+		if err != nil {
+			fmt.Println("interface down:", err)
 			continue
 		}
-		fmt.Println(" ", line)
-	}
-	if age := handshakeAge(*iface); age >= 0 {
-		fmt.Printf("  last handshake: %ds ago\n", age)
-	} else {
-		fmt.Println("  last handshake: never")
+		scanner := bufio.NewScanner(strings.NewReader(out))
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.Contains(line, "private key") {
+				fmt.Println("  private key: (hidden)")
+				continue
+			}
+			fmt.Println(" ", line)
+		}
+		if age := handshakeAge(ifname); age >= 0 {
+			fmt.Printf("  last handshake: %ds ago\n", age)
+		} else {
+			fmt.Println("  last handshake: never")
+		}
 	}
 }
 
