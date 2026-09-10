@@ -188,36 +188,86 @@ func handshakeAge(iface string) int64 {
 	return -1
 }
 
-// probeHost is resolved once per process for data-path probes.
+// probeHostIP caches the resolved probe target for probeDataPath.
 var probeHostIP = ""
+var probeHostName = ""
+
+// pickProbeHost returns the hostname to verify the data path against:
+// the first routed hostname, else opencode.ai. We probe what we route — a
+// generic IP-echo host may be blocked via tunnel egress while the real
+// destination works (observed: api.ipify.org dead, opencode.ai alive).
+func pickProbeHost(routed []string) string {
+	for _, r := range routed {
+		r = strings.TrimSpace(r)
+		if r == "" || strings.Contains(r, "/") {
+			continue
+		}
+		for _, c := range r {
+			if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+				return r
+			}
+		}
+	}
+	return "opencode.ai"
+}
+
+// resolveProbeIPs returns up to 4 distinct IPv4 addresses for host.
+func resolveProbeIPs(host string) []string {
+	out, err := sh("python3", "-c",
+		"import socket;print(' '.join(sorted(set(r[4][0] for r in socket.getaddrinfo('"+host+"',443,socket.AF_INET)))))")
+	if err != nil {
+		return nil
+	}
+	ips := []string{}
+	for _, ip := range strings.Fields(out) {
+		if ip != "" && len(ips) < 4 {
+			ips = append(ips, ip)
+		}
+	}
+	return ips
+}
 
 // probeDataPath sends real payload through iface to prove the data path
 // works, not just the handshake (servers throttle handshakes-ok/data-dead).
+// Tries every resolved IP: anycast frontends may block tunnel egress on
+// some VIPs while others work (observed: 2 of 4 opencode.ai IPs dead).
 // Returns true if bytes flow both ways within timeout.
-func probeDataPath(iface string, timeoutSec int) bool {
-	if probeHostIP == "" {
-		out, err := sh("python3", "-c", "import socket;print(socket.gethostbyname('api.ipify.org'))")
-		if err != nil || strings.TrimSpace(out) == "" {
-			return false
-		}
-		probeHostIP = strings.TrimSpace(out)
+func probeDataPath(iface string, timeoutSec int, probeHost string) bool {
+	if probeHost == "" {
+		probeHost = "opencode.ai"
 	}
-	routeDst := probeHostIP + "/32"
-	sh("ip", "route", "replace", routeDst, "dev", iface)
-	sh("ip", "rule", "add", "to", routeDst, "lookup", "main", "pref", "99")
-	defer sh("ip", "route", "del", routeDst, "dev", iface)
-	// Keep the pref-99 rule: harmless, reused by later probes.
-	time.Sleep(2 * time.Second)
-	if !pathOK(probeHostIP, iface) {
+	ips := resolveProbeIPs(probeHost)
+	if len(ips) == 0 {
 		return false
 	}
-	for attempt := 0; attempt < 2; attempt++ {
-		out, err := sh("curl", "-s", "--max-time", fmt.Sprint(timeoutSec),
-			"--resolve", "api.ipify.org:443:"+probeHostIP, "https://api.ipify.org")
-		if err == nil && out != "" && !strings.Contains(out, "<") {
+	perIP := timeoutSec
+	if perIP > 8 {
+		perIP = 8
+	}
+	for _, ip := range ips {
+		probeHostIP = ip
+		probeHostName = probeHost
+		routeDst := ip + "/32"
+		sh("ip", "route", "replace", routeDst, "dev", iface)
+		sh("ip", "rule", "add", "to", routeDst, "lookup", "main", "pref", "99")
+		time.Sleep(2 * time.Second)
+		ok := false
+		if pathOK(ip, iface) {
+			for attempt := 0; attempt < 2; attempt++ {
+				out, err := sh("curl", "-s", "--max-time", fmt.Sprint(perIP),
+					"--resolve", probeHost+":443:"+ip, "https://"+probeHost)
+				if err == nil && strings.TrimSpace(out) != "" {
+					ok = true
+					break
+				}
+				time.Sleep(2 * time.Second)
+			}
+		}
+		sh("ip", "route", "del", routeDst, "dev", iface)
+		sh("ip", "rule", "del", "to", routeDst, "lookup", "main", "pref", "99")
+		if ok {
 			return true
 		}
-		time.Sleep(3 * time.Second)
 	}
 	return false
 }
@@ -242,7 +292,7 @@ func ifaceTransfer(iface string) (uint64, uint64, error) {
 
 // peerReady waits for a handshake then verifies the data path with a real
 // probe. Returns true only if payload actually flows through iface.
-func peerReady(iface string, timeout int, probe bool, verbose bool) bool {
+func peerReady(iface string, timeout int, probe bool, verbose bool, probeHost string) bool {
 	deadline := time.Now().Add(time.Duration(timeout) * time.Second)
 	probedOnce := false
 	for time.Now().Before(deadline) {
@@ -251,7 +301,7 @@ func peerReady(iface string, timeout int, probe bool, verbose bool) bool {
 			if !probe {
 				return true
 			}
-			if probeDataPath(iface, 15) {
+			if probeDataPath(iface, 15, probeHost) {
 				return true
 			}
 			if probedOnce {
@@ -269,7 +319,7 @@ func peerReady(iface string, timeout int, probe bool, verbose bool) bool {
 // activate walks peers round-robin from start and activates the first
 // that completes a handshake within timeout. Returns peer index.
 // Pass nil stats to disable cooldown skipping (e.g. manual rotate).
-func activate(iface string, peers []Peer, start, timeout int, verbose bool, stats map[string]*PeerStats) (int, error) {
+func activate(iface string, peers []Peer, start, timeout int, verbose bool, stats map[string]*PeerStats, probeHost string) (int, error) {
 	n := len(peers)
 	for k := 0; k < n; k++ {
 		i := (start + k) % n
@@ -289,7 +339,7 @@ func activate(iface string, peers []Peer, start, timeout int, verbose bool, stat
 			fmt.Printf("   ✗ apply failed: %v\n", err)
 			continue
 		}
-		if peerReady(iface, timeout, true, verbose) {
+		if peerReady(iface, timeout, true, verbose, probeHost) {
 			if verbose {
 				fmt.Printf("   ✅ peer [%d] %s handshake + data ok\n", i, p.Name)
 			}
@@ -628,7 +678,7 @@ func peerCooldown(m map[string]*PeerStats, peerName string) (bool, string) {
 // rotateStandby brings the next peer up on the standby iface and verifies
 // handshake AND data path. Recently-failed peers are skipped (cooldown).
 // Caller flips routes to the standby first, then drops the old peer.
-func rotateStandby(peers []Peer, cur int, standby string, timeout int, verbose bool, stats map[string]*PeerStats) (int, error) {
+func rotateStandby(peers []Peer, cur int, standby string, timeout int, verbose bool, stats map[string]*PeerStats, probeHost string) (int, error) {
 	n := len(peers)
 	for k := 1; k <= n; k++ {
 		next := (cur + k) % n
@@ -646,7 +696,7 @@ func rotateStandby(peers []Peer, cur int, standby string, timeout int, verbose b
 			fmt.Printf("   ✗ apply failed: %v\n", err)
 			continue
 		}
-		if !peerReady(standby, timeout, true, verbose) {
+		if !peerReady(standby, timeout, true, verbose, probeHost) {
 			fmt.Printf("   ✗ peer [%d] no handshake/data, trying next\n", next)
 			continue
 		}
@@ -888,11 +938,6 @@ func cmdProxy(args []string) {
 	// Load stats before first activation so cooldown skips recently-failed
 	// peers instead of re-picking the blackholed one after a restart.
 	bootStats := loadStats(*statsPath)
-	idx, err := activate(*iface, peers, 0, *timeout, *verbose, bootStats)
-	if err != nil {
-		fmt.Println("❌", err)
-		os.Exit(1)
-	}
 	egress := *iface // interface currently carrying routed traffic
 	routed := []string{}
 	if *routes != "" {
@@ -901,6 +946,15 @@ func cmdProxy(args []string) {
 				routed = append(routed, r)
 			}
 		}
+	}
+	// Data-path probes hit the routed host itself: generic IP-echo hosts
+	// may be blocked via tunnel egress while the real destination works.
+	probeHost := pickProbeHost(routed)
+	fmt.Printf("🔍 data-path probe target: %s\n", probeHost)
+	idx, err := activate(*iface, peers, 0, *timeout, *verbose, bootStats, probeHost)
+	if err != nil {
+		fmt.Println("❌", err)
+		os.Exit(1)
 	}
 	flipRoutes := func(dev string) {
 		for _, r := range routed {
@@ -1006,7 +1060,7 @@ func cmdProxy(args []string) {
 				recordFail(peers[cur].Name, reason)
 				setKillswitch(routed, true, egress)
 				backoff(failStreak)
-				if next, err := activate(egress, peers, cur+1, *timeout, *verbose, stats); err == nil {
+				if next, err := activate(egress, peers, cur+1, *timeout, *verbose, stats, probeHost); err == nil {
 					cur = next
 					atomic.StoreInt64(&activeIdx, int64(cur))
 					markActive()
@@ -1036,7 +1090,7 @@ func cmdProxy(args []string) {
 					backoff(1)
 					return
 				}
-				next, err := rotateStandby(peers, cur, standby, *timeout, *verbose, stats)
+				next, err := rotateStandby(peers, cur, standby, *timeout, *verbose, stats, probeHost)
 				if err != nil {
 					fmt.Println("⚠️  rotation failed, keeping current peer:", err)
 					backoff(1)
@@ -1303,18 +1357,25 @@ const dashHTML = `<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>WGTunnel Dashboard</title>
+<script>(function(){try{var t=localStorage.getItem('wgt-theme');if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t)}catch(e){}})();</script>
 <style>
-:root{--bg:#0b1020;--card:#141b33;--line:#232c4d;--txt:#e8ecf8;--dim:#8b94b3;--acc:#5b8cff;--ok:#34d399;--warn:#fbbf24;--bad:#f87171}
+:root{color-scheme:light;--bg:#f1f5f9;--card:#ffffff;--line:#e2e8f0;--txt:#0f172a;--dim:#64748b;--acc:#2563eb;--acc2:#7c3aed;--ok:#059669;--warn:#b45309;--bad:#dc2626;--code:#334155;--glow:rgba(37,99,235,.18)}
+:root[data-theme="dark"]{color-scheme:dark;--bg:#0b1020;--card:#141b33;--line:#232c4d;--txt:#e8ecf8;--dim:#8b94b3;--acc:#5b8cff;--acc2:#9d6bff;--ok:#34d399;--warn:#fbbf24;--bad:#f87171;--code:#b9c2e2;--glow:rgba(91,140,255,.25)}
+@media (prefers-color-scheme:dark){:root:not([data-theme]){color-scheme:dark;--bg:#0b1020;--card:#141b33;--line:#232c4d;--txt:#e8ecf8;--dim:#8b94b3;--acc:#5b8cff;--acc2:#9d6bff;--ok:#34d399;--warn:#fbbf24;--bad:#f87171;--code:#b9c2e2;--glow:rgba(91,140,255,.25)}}
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:radial-gradient(1200px 600px at 20% -10%,#1b2450 0%,var(--bg) 55%) fixed,var(--bg);color:var(--txt);font:14px/1.5 -apple-system,'Segoe UI',Roboto,Inter,Arial,sans-serif;padding:24px;max-width:1100px;margin:0 auto}
+body{background:var(--bg);color:var(--txt);font:14px/1.5 -apple-system,'Segoe UI',Roboto,Inter,Arial,sans-serif;padding:24px;max-width:1100px;margin:0 auto}
 header{display:flex;align-items:center;gap:12px;margin-bottom:20px}
-.logo{width:40px;height:40px;border-radius:12px;background:linear-gradient(135deg,#5b8cff,#9d6bff);display:flex;align-items:center;justify-content:center;font-size:20px;box-shadow:0 4px 20px rgba(91,140,255,.4)}
+.logo{width:40px;height:40px;border-radius:12px;background:linear-gradient(135deg,var(--acc),var(--acc2));display:flex;align-items:center;justify-content:center;font-size:20px;box-shadow:0 4px 20px var(--glow)}
 h1{font-size:22px;font-weight:700}
 .sub{color:var(--dim);font-size:12px}
-.pill{margin-left:auto;padding:5px 14px;border-radius:99px;font-size:12px;font-weight:600;background:rgba(52,211,153,.12);color:var(--ok);border:1px solid rgba(52,211,153,.35)}
-.pill.down{background:rgba(248,113,113,.12);color:var(--bad);border-color:rgba(248,113,113,.35)}
+.spacer{margin-left:auto}
+.tbtn{background:var(--card);border:1px solid var(--line);color:var(--txt);font-weight:600;padding:6px 12px;border-radius:99px;cursor:pointer;font-size:12px;box-shadow:none}
+.tbtn:hover{border-color:var(--acc)}
+.pill{padding:5px 14px;border-radius:99px;font-size:12px;font-weight:600;background:color-mix(in srgb,var(--ok) 12%,transparent);color:var(--ok);border:1px solid color-mix(in srgb,var(--ok) 35%,transparent)}
+.pill.down{background:color-mix(in srgb,var(--bad) 12%,transparent);color:var(--bad);border-color:color-mix(in srgb,var(--bad) 35%,transparent)}
+.pill.stale{background:color-mix(in srgb,var(--warn) 14%,transparent);color:var(--warn);border-color:color-mix(in srgb,var(--warn) 35%,transparent)}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px}
-.card{background:linear-gradient(180deg,rgba(255,255,255,.03),transparent),var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 16px}
 .card .k{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)}
 .card .v{font-size:22px;font-weight:700;margin-top:4px}
 .card .u{font-size:12px;color:var(--dim);font-weight:400}
@@ -1322,19 +1383,19 @@ h1{font-size:22px;font-weight:700}
 .panel h2{font-size:14px;margin-bottom:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.08em}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th{text-align:left;color:var(--dim);font-weight:600;padding:8px;border-bottom:1px solid var(--line);font-size:11px;text-transform:uppercase;letter-spacing:.06em}
-td{padding:8px;border-bottom:1px solid rgba(35,44,77,.5)}
-tr.active td{background:rgba(91,140,255,.08)}
+td{padding:8px;border-bottom:1px solid var(--line)}
+tr.active td{background:color-mix(in srgb,var(--acc) 8%,transparent)}
 tr:last-child td{border-bottom:none}
-.badge{padding:2px 10px;border-radius:99px;font-size:11px;font-weight:600}
-.badge.active{background:rgba(52,211,153,.15);color:var(--ok)}
-.badge.cool{background:rgba(251,191,36,.15);color:var(--warn)}
-.badge.idle{background:rgba(139,148,179,.15);color:var(--dim)}
+.badge{padding:2px 10px;border-radius:99px;font-size:11px;font-weight:600;white-space:nowrap}
+.badge.active{background:color-mix(in srgb,var(--ok) 15%,transparent);color:var(--ok)}
+.badge.cool{background:color-mix(in srgb,var(--warn) 15%,transparent);color:var(--warn)}
+.badge.idle{background:color-mix(in srgb,var(--dim) 15%,transparent);color:var(--dim)}
 .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-button{background:linear-gradient(135deg,#5b8cff,#7a5cff);border:none;color:#fff;font-weight:600;padding:10px 22px;border-radius:10px;cursor:pointer;font-size:14px;box-shadow:0 4px 16px rgba(91,140,255,.35)}
-button:hover{filter:brightness(1.12)}
-button:disabled{opacity:.5;cursor:wait}
+button.cta{background:linear-gradient(135deg,var(--acc),var(--acc2));border:none;color:#fff;font-weight:600;padding:10px 22px;border-radius:10px;cursor:pointer;font-size:14px}
+button.cta:hover{filter:brightness(1.12)}
+button.cta:disabled{opacity:.5;cursor:wait}
 #msg{font-size:13px;color:var(--dim)}
-pre{background:#0a0e1c;border:1px solid var(--line);border-radius:10px;padding:12px;font-size:12px;max-height:260px;overflow:auto;white-space:pre-wrap;color:#b9c2e2}
+pre{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:12px;font-size:12px;max-height:260px;overflow:auto;white-space:pre-wrap;color:var(--code)}
 .routes{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:var(--dim)}
 footer{text-align:center;color:var(--dim);font-size:12px;margin-top:8px}
 </style>
@@ -1343,6 +1404,8 @@ footer{text-align:center;color:var(--dim);font-size:12px;margin-top:8px}
 <header>
 <div class="logo">&#128737;</div>
 <div><h1>WGTunnel</h1><div class="sub" id="sub">rotating WireGuard peer pool</div></div>
+<div class="spacer"></div>
+<button class="tbtn" id="theme" type="button" aria-label="Theme: system">&#9681; system</button>
 <div class="pill" id="pill">checking…</div>
 </header>
 <div class="grid" id="cards"></div>
@@ -1351,48 +1414,57 @@ footer{text-align:center;color:var(--dim);font-size:12px;margin-top:8px}
 <tbody id="peers"></tbody>
 </table></div></div>
 <div class="panel"><h2>Control</h2><div class="row">
-<button id="rot" onclick="rotate()">&#128260; Rotate now</button>
+<button class="cta" id="rot" onclick="rotate()">&#128260; Rotate now</button>
 <span id="msg"></span>
 </div><div style="margin-top:10px" class="routes" id="routes"></div></div>
 <div class="panel"><h2>Live log</h2><pre id="log">loading…</pre></div>
 <footer>wgtunnel dashboard &middot; auto-refresh 3s &middot; localhost only</footer>
 <script>
-var busy=false;
+var busy=false,hadData=false,lastSig='';
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')}
 function fmtUptime(s){s=Math.floor(s);var h=Math.floor(s/3600),m=Math.floor(s%3600/60);if(h>0)return h+'h '+m+'m';if(m>0)return m+'m '+Math.floor(s%60)+'s';return s+'s'}
+var THEMES=['system','light','dark'],GLYPH={system:'&#9681;',light:'&#9728;',dark:'&#9729;'};
+function themeMode(){try{var t=localStorage.getItem('wgt-theme');if(t==='light'||t==='dark')return t}catch(e){}return 'system'}
+function applyTheme(m){var b=document.getElementById('theme');if(m==='system'){document.documentElement.removeAttribute('data-theme')}else{document.documentElement.setAttribute('data-theme',m)}b.innerHTML=GLYPH[m]+' '+m;b.setAttribute('aria-label','Theme: '+m)}
+function cycleTheme(){var m=THEMES[(THEMES.indexOf(themeMode())+1)%THEMES.length];try{if(m==='system'){localStorage.removeItem('wgt-theme')}else{localStorage.setItem('wgt-theme',m)}}catch(e){}applyTheme(m)}
+document.getElementById('theme').addEventListener('click',cycleTheme);
+applyTheme(themeMode());
 function badge(p){
   if(p.active)return '<span class="badge active">active'+(p.iface?' &middot; '+esc(p.iface):'')+'</span>';
   if(p.status&&p.status.indexOf('cooldown')===0)return '<span class="badge cool">'+esc(p.status)+'</span>';
   return '<span class="badge idle">standby</span>';
 }
 function card(k,v,u){return '<div class="card"><div class="k">'+k+'</div><div class="v">'+v+' <span class="u">'+u+'</span></div></div>'}
+function setPill(mode,text){var pill=document.getElementById('pill');pill.textContent=text;pill.className='pill'+(mode==='ok'?'':mode==='stale'?' stale':' down')}
 async function refresh(){
   try{
     var r=await fetch('/api/status');if(!r.ok)throw 0;var s=await r.json();
-    var pill=document.getElementById('pill');
-    var ok=s.handshake_s>=0&&s.handshake_s<180;
-    pill.textContent=ok?'● tunnel up':'● tunnel down';
-    pill.className='pill'+(ok?'':' down');
-    document.getElementById('sub').textContent='peer '+esc(s.active_peer||'?')+' on '+esc(s.iface||'?')+' · '+esc(s.listen||'');
-    document.getElementById('cards').innerHTML=
-      card('Active peer',esc(s.active_peer||'—'),esc(s.active_endpoint||''))+
-      card('Handshake',s.handshake_s>=0?s.handshake_s+'s':'never','ago')+
-      card('Requests today',s.req_today,'/ total '+s.req_total)+
-      card('Transfer today','&#8595;'+s.rx_mb.toFixed(1)+' &#8593;'+s.tx_mb.toFixed(1),'MB')+
-      card('Uptime',fmtUptime(s.uptime_s),'')+
-      card('Rotation','every '+s.interval_s+'s',s.cooldowns+' cooling');
-    document.getElementById('routes').textContent='routed: '+(s.routes||'(none)')+' · '+s.peers+' peers';
     var r2=await fetch('/api/peers');var peers=await r2.json();
-    var html='';
-    for(var i=0;i<peers.length;i++){var p=peers[i];
-      html+='<tr'+(p.active?' class="active"':'')+'><td>'+p.index+'</td><td>'+esc(p.name)+'</td><td>'+esc(p.endpoint)+'</td><td>'+p.requests+'</td><td>'+p.today+'</td><td>'+p.last_day+'</td><td>&#8595;'+p.rx_mb.toFixed(1)+' &#8593;'+p.tx_mb.toFixed(1)+' MB</td><td>'+badge(p)+'</td></tr>';
+    var ok=s.handshake_s>=0&&s.handshake_s<180;
+    setPill(ok?'ok':'down',ok?'● tunnel up':'● tunnel down');
+    document.getElementById('sub').textContent='peer '+esc(s.active_peer||'?')+' on '+esc(s.iface||'?')+' · '+esc(s.listen||'');
+    var sig=JSON.stringify([s,peers]);
+    if(sig!==lastSig){
+      lastSig=sig;
+      document.getElementById('cards').innerHTML=
+        card('Active peer',esc(s.active_peer||'—'),esc(s.active_endpoint||''))+
+        card('Handshake',s.handshake_s>=0?s.handshake_s+'s':'never','ago')+
+        card('Requests today',s.req_today,'/ total '+s.req_total)+
+        card('Transfer today','&#8595;'+s.rx_mb.toFixed(1)+' &#8593;'+s.tx_mb.toFixed(1),'MB')+
+        card('Uptime',fmtUptime(s.uptime_s),'')+
+        card('Rotation','every '+s.interval_s+'s',s.cooldowns+' cooling');
+      document.getElementById('routes').textContent='routed: '+(s.routes||'(none)')+' · '+s.peers+' peers';
+      var html='';
+      for(var i=0;i<peers.length;i++){var p=peers[i];
+        html+='<tr'+(p.active?' class="active"':'')+'><td>'+p.index+'</td><td>'+esc(p.name)+'</td><td>'+esc(p.endpoint)+'</td><td>'+p.requests+'</td><td>'+p.today+'</td><td>'+p.last_day+'</td><td>&#8595;'+p.rx_mb.toFixed(1)+' &#8593;'+p.tx_mb.toFixed(1)+' MB</td><td>'+badge(p)+'</td></tr>';
+      }
+      document.getElementById('peers').innerHTML=html;
     }
-    document.getElementById('peers').innerHTML=html;
     var r3=await fetch('/api/log');var lg=await r3.json();
     document.getElementById('log').textContent=lg.lines.join('\n')||'(empty)';
+    hadData=true;
   }catch(e){
-    document.getElementById('pill').textContent='● unreachable';
-    document.getElementById('pill').className='pill down';
+    if(hadData){setPill('stale','● stale — retrying')}else{setPill('down','● unreachable')}
   }
 }
 async function rotate(){
@@ -1406,7 +1478,8 @@ async function rotate(){
   }catch(e){document.getElementById('msg').textContent='request failed';}
   setTimeout(function(){busy=false;b.disabled=false;refresh();},4000);
 }
-refresh();setInterval(refresh,3000);
+function tick(){if(!document.hidden)refresh()}
+refresh();setInterval(tick,3000);
 </script>
 </body>
 </html>`
@@ -1436,7 +1509,7 @@ func cmdRotate(args []string) {
 			start = v + 1
 		}
 	}
-	idx, err := activate(*iface, peers, start, *timeout, *verbose, nil)
+	idx, err := activate(*iface, peers, start, *timeout, *verbose, nil, "opencode.ai")
 	if err != nil {
 		fmt.Println("❌", err)
 		os.Exit(1)
@@ -1596,19 +1669,13 @@ func cmdTest(args []string) {
 		fmt.Println("❌", err)
 		os.Exit(1)
 	}
-	// Resolve probe host once (direct DNS).
-	probeIPOut, err := sh("python3", "-c", "import socket;print(socket.gethostbyname('api.ipify.org'))")
-	if err != nil {
-		fmt.Println("❌ dns failed:", err)
-		os.Exit(1)
-	}
-	probeIP := strings.TrimSpace(probeIPOut)
+	// Data-path check hits opencode.ai (what we route): generic IP-echo
+	// hosts may be blocked via tunnel egress while real traffic works.
+	probeHost := "opencode.ai"
 	defer func() {
-		sh("ip", "route", "del", probeIP+"/32", "dev", *iface)
-		sh("ip", "rule", "del", "to", probeIP+"/32", "lookup", "main", "pref", "99")
 		sh("ip", "link", "del", "dev", *iface)
 	}()
-	fmt.Printf("%-4s %-22s %-16s %s\n", "#", "NAME", "ENDPOINT", "EXIT IP")
+	fmt.Printf("%-4s %-22s %-16s %s\n", "#", "NAME", "ENDPOINT", "PROBE "+probeHost)
 	for ti, i := range targets {
 		p := peers[i]
 		if err := applyPeer(*iface, p); err != nil {
@@ -1628,28 +1695,11 @@ func cmdTest(args []string) {
 			fmt.Printf("%-4d %-22s %-16s ✗ no handshake\n", i, p.Name, p.Endpoint)
 			continue
 		}
-		sh("ip", "route", "replace", probeIP+"/32", "dev", *iface)
-		sh("ip", "rule", "add", "to", probeIP+"/32", "lookup", "main", "pref", "99")
-		time.Sleep(2 * time.Second)
-		if !pathOK(probeIP, *iface) {
-			fmt.Printf("%-4d %-22s %-16s ✗ kernel path not via %s\n", i, p.Name, p.Endpoint, *iface)
-			continue
-		}
-		var out string
-		var err error
-		for attempt := 0; attempt < 2; attempt++ {
-			out, err = sh("curl", "-s", "--max-time", "15",
-				"--resolve", "api.ipify.org:443:"+probeIP, "https://api.ipify.org")
-			if err == nil && out != "" && !strings.Contains(out, "<") {
-				break
-			}
-			time.Sleep(3 * time.Second)
-		}
-		if err != nil || out == "" || strings.Contains(out, "<") {
+		if !probeDataPath(*iface, 15, probeHost) {
 			fmt.Printf("%-4d %-22s %-16s ✗ probe failed\n", i, p.Name, p.Endpoint)
 			continue
 		}
-		fmt.Printf("%-4d %-22s %-16s ✅ %s\n", i, p.Name, p.Endpoint, out)
+		fmt.Printf("%-4d %-22s %-16s ✅ data ok\n", i, p.Name, p.Endpoint)
 		if ti < len(targets)-1 {
 			time.Sleep(time.Duration(*delay) * time.Second)
 		}
