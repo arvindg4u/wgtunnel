@@ -310,33 +310,54 @@ func saveStats(path string, m map[string]*PeerStats) {
 	_ = os.WriteFile(path, data, 0600)
 }
 
-// snapshotTransfer records current wg transfer totals for peerName.
-func snapshotTransfer(iface, peerName string, m map[string]*PeerStats) {
-	out, err := sh("wg", "show", iface, "transfer")
+// transferTracker accumulates per-peer traffic from raw wg counters.
+// wg counters are per-interface (reset when the peer changes), so we track
+// the last-seen baseline and credit only the delta to the active peer.
+type transferTracker struct {
+	lastRx, lastTx uint64
+	haveBaseline   bool
+}
+
+// credit attributes counter movement on iface to peerName since the last
+// call. Call with the CURRENT active peer on every tick; call reset() when
+// switching peers so the new peer's baseline starts clean.
+func (t *transferTracker) credit(iface, peerName string, m map[string]*PeerStats) {
+	rx, tx, err := ifaceTransfer(iface)
 	if err != nil {
 		return
 	}
-	for _, line := range strings.Split(out, "\n") {
-		f := strings.Fields(line)
-		if len(f) != 3 {
-			continue
-		}
-		rx, _ := strconv.ParseUint(f[1], 10, 64)
-		tx, _ := strconv.ParseUint(f[2], 10, 64)
-		st := m[peerName]
-		if st == nil {
-			st = &PeerStats{}
-			m[peerName] = st
-		}
-		// Single-peer-at-a-time: totals belong to the active peer.
-		if rx >= st.RxBytes {
-			st.RxBytes = rx
-		}
-		if tx >= st.TxBytes {
-			st.TxBytes = tx
-		}
-		break // only one peer configured at a time
+	if !t.haveBaseline {
+		t.lastRx, t.lastTx = rx, tx
+		t.haveBaseline = true
+		return
 	}
+	st := m[peerName]
+	if st == nil {
+		st = &PeerStats{}
+		m[peerName] = st
+	}
+	// Counters reset on peer change; a drop means a fresh baseline.
+	if rx >= t.lastRx {
+		st.RxBytes += rx - t.lastRx
+	}
+	if tx >= t.lastTx {
+		st.TxBytes += tx - t.lastTx
+	}
+	t.lastRx, t.lastTx = rx, tx
+}
+
+// reset starts a fresh baseline (call after switching peers/interfaces).
+func (t *transferTracker) reset(iface string) {
+	if rx, tx, err := ifaceTransfer(iface); err == nil {
+		t.lastRx, t.lastTx = rx, tx
+	}
+	t.haveBaseline = true
+}
+
+// snapshotTransfer credits iface movement since the tracker's baseline to
+// peerName (used at rotation/failover boundaries).
+func snapshotTransfer(tr *transferTracker, iface, peerName string, m map[string]*PeerStats) {
+	tr.credit(iface, peerName, m)
 }
 
 // ---- Killswitch (fail-closed): routed destinations must never leak direct.
@@ -857,6 +878,8 @@ func cmdProxy(args []string) {
 			failStreak := 0
 			var lastRx, lastTx uint64
 			lastReqCount := atomic.LoadInt64(&reqCount)
+			tr := &transferTracker{}
+			tr.reset(egress)
 			if rx, tx, err := ifaceTransfer(egress); err == nil {
 				lastRx, lastTx = rx, tx
 			}
@@ -894,6 +917,7 @@ func cmdProxy(args []string) {
 					cur = next
 					atomic.StoreInt64(&activeIdx, int64(cur))
 					markActive()
+					tr.reset(egress)
 					if rx, tx, err := ifaceTransfer(egress); err == nil {
 						lastRx, lastTx = rx, tx
 					}
@@ -923,6 +947,9 @@ func cmdProxy(args []string) {
 					// while NEW requests arrived = data stall. (Idle
 					// periods freeze counters normally, so gate on
 					// fresh requests since the last tick.)
+					// Also credits this tick's delta to the active peer.
+					tr.credit(egress, peers[cur].Name, stats)
+					saveStats(*statsPath, stats)
 					rx, tx, terr := ifaceTransfer(egress)
 					reqs := atomic.LoadInt64(&reqCount)
 					if terr == nil {
@@ -952,9 +979,9 @@ func cmdProxy(args []string) {
 						backoff(1)
 						continue
 					}
-					// Snapshot the OLD peer's totals before flipping, or its
-					// traffic gets attributed to the new peer.
-					snapshotTransfer(egress, peers[cur].Name, stats)
+					// Credit the OLD peer's final delta before flipping, or
+					// its traffic gets attributed to the new peer.
+					snapshotTransfer(tr, egress, peers[cur].Name, stats)
 					// Flip traffic to warmed standby, drop old peer, swap roles.
 					oldEgress, oldPeer := egress, cur
 					egress = standby
@@ -964,6 +991,7 @@ func cmdProxy(args []string) {
 					cur = next
 					atomic.StoreInt64(&activeIdx, int64(cur))
 					markActive()
+					tr.reset(egress)
 					saveStats(*statsPath, stats)
 					fmt.Printf("🔄 Rotated to peer [%d] %s (egress %s)\n", cur, peers[cur].Name, egress)
 				}
