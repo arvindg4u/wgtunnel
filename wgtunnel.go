@@ -51,17 +51,47 @@ func sh(name string, args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
-// ensureDaemon starts wireguard-go userspace if the iface is missing.
-// No-op on kernels with native WireGuard (interface creatable via ip).
-func ensureDaemon(iface string) {
+// killStaleDaemon kills orphaned wireguard-go processes for iface whose
+// interface is gone (typical after reboot: daemon reparented, iface lost).
+func killStaleDaemon(iface string) {
 	if _, err := sh("wg", "show", iface); err == nil {
-		return
+		return // live interface, daemon fine
 	}
+	if out, err := sh("pgrep", "-f", "wireguard-go "+iface); err == nil && out != "" {
+		for _, pidStr := range strings.Fields(out) {
+			if pid, err := strconv.Atoi(pidStr); err == nil && pid != os.Getpid() {
+				fmt.Printf("🧹 killing stale wireguard-go for %s (PID %d)\n", iface, pid)
+				if p, err := os.FindProcess(pid); err == nil {
+					p.Signal(syscall.SIGTERM)
+				}
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// ensureDaemon starts wireguard-go userspace if the iface is missing and
+// waits until the interface actually answers. Returns error on cold-start
+// failure instead of letting setconf fail cryptically later.
+// No-op on kernels with native WireGuard (interface creatable via ip).
+func ensureDaemon(iface string) error {
+	if _, err := sh("wg", "show", iface); err == nil {
+		return nil
+	}
+	killStaleDaemon(iface)
 	cmd := exec.Command("wireguard-go", iface)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
-	_ = cmd.Start() // daemonizes itself; child outlives us
-	time.Sleep(2 * time.Second)
+	if err := cmd.Start(); err != nil { // daemonizes itself; child outlives us
+		return fmt.Errorf("wireguard-go start: %v", err)
+	}
+	for i := 0; i < 15; i++ {
+		time.Sleep(2 * time.Second)
+		if _, err := sh("wg", "show", iface); err == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("wireguard-go for %s never came up (check /dev/net/tun, wireguard-go binary)", iface)
 }
 
 // applyPeer writes a stripped wg config for peers[i] and activates it.
@@ -81,8 +111,27 @@ func applyPeer(iface string, p Peer) error {
 		return err
 	}
 	tmp.Close()
-	if _, err := sh("wg", "setconf", iface, tmp.Name()); err != nil {
-		return fmt.Errorf("wg setconf: %v", err)
+	// Retry: right after daemon start the iface can still be settling.
+	var setOut string
+	var setErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(3 * time.Second)
+		}
+		setOut, setErr = sh("wg", "setconf", iface, tmp.Name())
+		if setErr == nil {
+			break
+		}
+	}
+	if setErr != nil {
+		hint := ""
+		if _, derr := sh("wg", "show", iface); derr != nil {
+			hint = " (interface missing — wireguard-go daemon not running?)"
+		}
+		if strings.TrimSpace(setOut) != "" {
+			return fmt.Errorf("wg setconf: %v: %s%s", setErr, strings.TrimSpace(setOut), hint)
+		}
+		return fmt.Errorf("wg setconf: %v%s", setErr, hint)
 	}
 	// Address may already exist when re-applying; ignore that error.
 	addrOut, _ := sh("ip", "-4", "address", "add", addr, "dev", iface)
@@ -800,7 +849,10 @@ func cmdProxy(args []string) {
 		fmt.Println("❌ load peers:", err)
 		os.Exit(1)
 	}
-	ensureDaemon(*iface)
+	if err := ensureDaemon(*iface); err != nil {
+		fmt.Println("❌", err)
+		os.Exit(1)
+	}
 	standby := *iface + "2"
 	// Load stats before first activation so cooldown skips recently-failed
 	// peers instead of re-picking the blackholed one after a restart.
@@ -972,7 +1024,11 @@ func cmdProxy(args []string) {
 					}
 					failover("stale handshake")
 				case <-rotTick.C:
-					ensureDaemon(standby)
+					if err := ensureDaemon(standby); err != nil {
+						fmt.Println("⚠️  standby daemon:", err)
+						backoff(1)
+						continue
+					}
 					next, err := rotateStandby(peers, cur, standby, *timeout, *verbose, stats)
 					if err != nil {
 						fmt.Println("⚠️  rotation failed, keeping current peer:", err)
@@ -1028,7 +1084,10 @@ func cmdRotate(args []string) {
 		fmt.Println("❌ load peers:", err)
 		os.Exit(1)
 	}
-	ensureDaemon(*iface)
+	if err := ensureDaemon(*iface); err != nil {
+		fmt.Println("❌", err)
+		os.Exit(1)
+	}
 	// Start search after currently-implied peer is unknowable; just rotate to next
 	// by reading a state file.
 	state := "/tmp/wgtunnel.idx"
@@ -1186,7 +1245,10 @@ func cmdTest(args []string) {
 			targets = append(targets, i)
 		}
 	}
-	ensureDaemon(*iface)
+	if err := ensureDaemon(*iface); err != nil {
+		fmt.Println("❌", err)
+		os.Exit(1)
+	}
 	// Resolve probe host once (direct DNS).
 	probeIPOut, err := sh("python3", "-c", "import socket;print(socket.gethostbyname('api.ipify.org'))")
 	if err != nil {
