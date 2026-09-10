@@ -477,7 +477,9 @@ func handleCONNECT(w http.ResponseWriter, r *http.Request, verbose bool, block [
 		n := atomic.AddInt64(&reqCount, 1)
 		fmt.Printf("\n🔒 [CONNECT #%d] %s\n", n, host)
 	}
-	serverConn, err := net.DialTimeout("tcp", host, 15*time.Second)
+	// Force IPv4: tunnel policy routes are v4-only, so a v6 dial here
+	// would bypass the tunnel and leak direct.
+	serverConn, err := net.DialTimeout("tcp4", host, 15*time.Second)
 	if err != nil {
 		if verbose {
 			fmt.Printf("   ✗ dial failed: %v\n", err)
