@@ -139,13 +139,100 @@ func handshakeAge(iface string) int64 {
 	return -1
 }
 
+// probeHost is resolved once per process for data-path probes.
+var probeHostIP = ""
+
+// probeDataPath sends real payload through iface to prove the data path
+// works, not just the handshake (servers throttle handshakes-ok/data-dead).
+// Returns true if bytes flow both ways within timeout.
+func probeDataPath(iface string, timeoutSec int) bool {
+	if probeHostIP == "" {
+		out, err := sh("python3", "-c", "import socket;print(socket.gethostbyname('api.ipify.org'))")
+		if err != nil || strings.TrimSpace(out) == "" {
+			return false
+		}
+		probeHostIP = strings.TrimSpace(out)
+	}
+	routeDst := probeHostIP + "/32"
+	sh("ip", "route", "replace", routeDst, "dev", iface)
+	sh("ip", "rule", "add", "to", routeDst, "lookup", "main", "pref", "99")
+	defer sh("ip", "route", "del", routeDst, "dev", iface)
+	// Keep the pref-99 rule: harmless, reused by later probes.
+	time.Sleep(2 * time.Second)
+	if !pathOK(probeHostIP, iface) {
+		return false
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		out, err := sh("curl", "-s", "--max-time", fmt.Sprint(timeoutSec),
+			"--resolve", "api.ipify.org:443:"+probeHostIP, "https://api.ipify.org")
+		if err == nil && out != "" && !strings.Contains(out, "<") {
+			return true
+		}
+		time.Sleep(3 * time.Second)
+	}
+	return false
+}
+
+// ifaceTransfer returns (rx, tx) totals for iface, or (0,0,err).
+func ifaceTransfer(iface string) (uint64, uint64, error) {
+	out, err := sh("wg", "show", iface, "transfer")
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) != 3 {
+			continue
+		}
+		rx, _ := strconv.ParseUint(f[1], 10, 64)
+		tx, _ := strconv.ParseUint(f[2], 10, 64)
+		return rx, tx, nil
+	}
+	return 0, 0, fmt.Errorf("no transfer data")
+}
+
+// peerReady waits for a handshake then verifies the data path with a real
+// probe. Returns true only if payload actually flows through iface.
+func peerReady(iface string, timeout int, probe bool, verbose bool) bool {
+	deadline := time.Now().Add(time.Duration(timeout) * time.Second)
+	probedOnce := false
+	for time.Now().Before(deadline) {
+		time.Sleep(2 * time.Second)
+		if age := handshakeAge(iface); age >= 0 && age < 120 {
+			if !probe {
+				return true
+			}
+			if probeDataPath(iface, 15) {
+				return true
+			}
+			if probedOnce {
+				return false // throttled peer: handshake ok, data dead
+			}
+			probedOnce = true
+			if verbose {
+				fmt.Println("   ⚠️  handshake ok but data probe failed, one retry...")
+			}
+		}
+	}
+	return false
+}
+
 // activate walks peers round-robin from start and activates the first
 // that completes a handshake within timeout. Returns peer index.
-func activate(iface string, peers []Peer, start, timeout int, verbose bool) (int, error) {
+// Pass nil stats to disable cooldown skipping (e.g. manual rotate).
+func activate(iface string, peers []Peer, start, timeout int, verbose bool, stats map[string]*PeerStats) (int, error) {
 	n := len(peers)
 	for k := 0; k < n; k++ {
 		i := (start + k) % n
 		p := peers[i]
+		if stats != nil {
+			if skip, left := peerCooldown(stats, p.Name); skip && n > 1 {
+				if verbose {
+					fmt.Printf("   ⏭️  peer [%d] %s in cooldown (%s), skipping\n", i, p.Name, left)
+				}
+				continue
+			}
+		}
 		if verbose {
 			fmt.Printf("🔄 Trying peer [%d] %s (%s)\n", i, p.Name, p.Endpoint)
 		}
@@ -153,17 +240,13 @@ func activate(iface string, peers []Peer, start, timeout int, verbose bool) (int
 			fmt.Printf("   ✗ apply failed: %v\n", err)
 			continue
 		}
-		deadline := time.Now().Add(time.Duration(timeout) * time.Second)
-		for time.Now().Before(deadline) {
-			time.Sleep(2 * time.Second)
-			if age := handshakeAge(iface); age >= 0 && age < 120 {
-				if verbose {
-					fmt.Printf("   ✅ peer [%d] %s handshake ok (%ds ago)\n", i, p.Name, age)
-				}
-				return i, nil
+		if peerReady(iface, timeout, true, verbose) {
+			if verbose {
+				fmt.Printf("   ✅ peer [%d] %s handshake + data ok\n", i, p.Name)
 			}
+			return i, nil
 		}
-		fmt.Printf("   ✗ peer [%d] %s no handshake, skipping\n", i, p.Name)
+		fmt.Printf("   ✗ peer [%d] %s no handshake/data, skipping\n", i, p.Name)
 	}
 	return -1, fmt.Errorf("no healthy peer")
 }
@@ -210,6 +293,8 @@ type PeerStats struct {
 	LastActive string `json:"last_active"`
 	RxBytes    uint64 `json:"rx_bytes"`
 	TxBytes    uint64 `json:"tx_bytes"`
+	DialFails  int64  `json:"dial_fails"`
+	LastFail   string `json:"last_fail,omitempty"`
 }
 
 func loadStats(path string) map[string]*PeerStats {
@@ -423,13 +508,44 @@ func removePeer(iface, pubkey string) {
 	sh("wg", "set", iface, "peer", pubkey, "remove")
 }
 
-// rotateStandby brings the next peer up on the standby iface and verifies it.
+// peerCooldown reports whether peerName failed recently and should be
+// skipped this rotation round. Cooldown scales with failure count
+// (5min × fails, capped at 1h) so flaky peers get another chance later.
+func peerCooldown(m map[string]*PeerStats, peerName string) (bool, string) {
+	st := m[peerName]
+	if st == nil || st.LastFail == "" {
+		return false, ""
+	}
+	// LastFail format: RFC3339 + " " + reason.
+	ts, _, _ := strings.Cut(st.LastFail, " ")
+	t, err := time.Parse(time.RFC3339, ts)
+	if err != nil {
+		return false, ""
+	}
+	cool := time.Duration(st.DialFails) * 5 * time.Minute
+	if cool > time.Hour {
+		cool = time.Hour
+	}
+	if remain := time.Until(t.Add(cool)); remain > 0 {
+		return true, fmt.Sprintf("%.0fm left", remain.Minutes()+1)
+	}
+	return false, ""
+}
+
+// rotateStandby brings the next peer up on the standby iface and verifies
+// handshake AND data path. Recently-failed peers are skipped (cooldown).
 // Caller flips routes to the standby first, then drops the old peer.
-func rotateStandby(peers []Peer, cur int, standby string, timeout int, verbose bool) (int, error) {
+func rotateStandby(peers []Peer, cur int, standby string, timeout int, verbose bool, stats map[string]*PeerStats) (int, error) {
 	n := len(peers)
 	for k := 1; k <= n; k++ {
 		next := (cur + k) % n
 		p := peers[next]
+		if skip, left := peerCooldown(stats, p.Name); skip {
+			if verbose {
+				fmt.Printf("   ⏭️  peer [%d] %s in cooldown (%s), skipping\n", next, p.Name, left)
+			}
+			continue
+		}
 		if verbose {
 			fmt.Printf("🔄 Warming standby peer [%d] %s on %s\n", next, p.Name, standby)
 		}
@@ -437,17 +553,8 @@ func rotateStandby(peers []Peer, cur int, standby string, timeout int, verbose b
 			fmt.Printf("   ✗ apply failed: %v\n", err)
 			continue
 		}
-		ok := false
-		deadline := time.Now().Add(time.Duration(timeout) * time.Second)
-		for time.Now().Before(deadline) {
-			time.Sleep(2 * time.Second)
-			if age := handshakeAge(standby); age >= 0 && age < 120 {
-				ok = true
-				break
-			}
-		}
-		if !ok {
-			fmt.Printf("   ✗ peer [%d] no handshake, trying next\n", next)
+		if !peerReady(standby, timeout, true, verbose) {
+			fmt.Printf("   ✗ peer [%d] no handshake/data, trying next\n", next)
 			continue
 		}
 		// Standby verified; caller flips routes, then drops old peer.
@@ -462,6 +569,15 @@ func rotateStandby(peers []Peer, cur int, standby string, timeout int, verbose b
 // ---- HTTP proxy (plain CONNECT passthrough, no MITM) ----
 
 var reqCount int64
+
+// dialFailCount counts consecutive upstream dial failures across all
+// handler goroutines. The health monitor reads it to detect a data-path
+// blackhole (handshake alive, payload dead) that handshakeAge can't see.
+var dialFailCount int64
+
+// noteDialFail bumps the consecutive-failure counter; noteDialOK resets it.
+func noteDialFail() { atomic.AddInt64(&dialFailCount, 1) }
+func noteDialOK()  { atomic.StoreInt64(&dialFailCount, 0) }
 
 func handleCONNECT(w http.ResponseWriter, r *http.Request, verbose bool, block []string, onReq func()) {
 	host := r.Host
@@ -481,12 +597,14 @@ func handleCONNECT(w http.ResponseWriter, r *http.Request, verbose bool, block [
 	// would bypass the tunnel and leak direct.
 	serverConn, err := net.DialTimeout("tcp4", host, 15*time.Second)
 	if err != nil {
+		noteDialFail()
 		if verbose {
 			fmt.Printf("   ✗ dial failed: %v\n", err)
 		}
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
+	noteDialOK()
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		serverConn.Close()
@@ -536,9 +654,11 @@ func handleHTTP(w http.ResponseWriter, r *http.Request, verbose bool, block []st
 	}
 	resp, err := http.DefaultTransport.RoundTrip(r)
 	if err != nil {
+		noteDialFail()
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
+	noteDialOK()
 	defer resp.Body.Close()
 	for k, v := range resp.Header {
 		for _, vv := range v {
@@ -661,7 +781,10 @@ func cmdProxy(args []string) {
 	}
 	ensureDaemon(*iface)
 	standby := *iface + "2"
-	idx, err := activate(*iface, peers, 0, *timeout, *verbose)
+	// Load stats before first activation so cooldown skips recently-failed
+	// peers instead of re-picking the blackholed one after a restart.
+	bootStats := loadStats(*statsPath)
+	idx, err := activate(*iface, peers, 0, *timeout, *verbose, bootStats)
 	if err != nil {
 		fmt.Println("❌", err)
 		os.Exit(1)
@@ -697,7 +820,7 @@ func cmdProxy(args []string) {
 		}()
 	}
 	block := loadBlocklist(*blocklist)
-	stats := loadStats(*statsPath)
+	stats := bootStats
 	var activeIdx int64 = int64(idx)
 	markActive := func() {
 		i := int(atomic.LoadInt64(&activeIdx))
@@ -732,10 +855,17 @@ func cmdProxy(args []string) {
 		go func() {
 			cur := idx
 			failStreak := 0
+			var lastRx, lastTx uint64
+			lastReqCount := atomic.LoadInt64(&reqCount)
+			if rx, tx, err := ifaceTransfer(egress); err == nil {
+				lastRx, lastTx = rx, tx
+			}
 			// Re-apply routes frequently (Android netd flushes ip rules).
 			routeTick := time.NewTicker(15 * time.Second)
 			defer routeTick.Stop()
 			// Health monitor doubles as killswitch enforcer.
+			// Three signals: handshake freshness, upstream dial failures
+			// (data blackhole with live handshake), and transfer stall.
 			healthTick := time.NewTicker(30 * time.Second)
 			defer healthTick.Stop()
 			rotTick := time.NewTicker(time.Duration(*interval) * time.Second)
@@ -744,6 +874,36 @@ func cmdProxy(args []string) {
 			} else {
 				defer rotTick.Stop()
 			}
+			recordFail := func(peerName, reason string) {
+				st := stats[peerName]
+				if st == nil {
+					st = &PeerStats{}
+					stats[peerName] = st
+				}
+				st.DialFails++
+				st.LastFail = time.Now().UTC().Format(time.RFC3339) + " " + reason
+				saveStats(*statsPath, stats)
+			}
+			failover := func(reason string) {
+				failStreak++
+				fmt.Printf("⚠️  tunnel unhealthy (%s, streak %d) — killswitch ON, re-activating\n", reason, failStreak)
+				recordFail(peers[cur].Name, reason)
+				setKillswitch(routed, true, egress)
+				backoff(failStreak)
+				if next, err := activate(egress, peers, cur+1, *timeout, *verbose, stats); err == nil {
+					cur = next
+					atomic.StoreInt64(&activeIdx, int64(cur))
+					markActive()
+					if rx, tx, err := ifaceTransfer(egress); err == nil {
+						lastRx, lastTx = rx, tx
+					}
+					lastReqCount = atomic.LoadInt64(&reqCount)
+					// Fresh peer just proved its data path; don't let
+					// in-flight failures on the dead peer trip another
+					// failover on the next tick.
+					atomic.StoreInt64(&dialFailCount, 0)
+				}
+			}
 			// Jitter rotation start so restarts don't thunder.
 			time.Sleep(time.Duration(time.Now().UnixNano()%10) * time.Second)
 			for {
@@ -751,6 +911,30 @@ func cmdProxy(args []string) {
 				case <-routeTick.C:
 					flipRoutes(egress)
 				case <-healthTick.C:
+					// Signal 1: consecutive upstream dial failures =
+					// blackhole even with a fresh handshake. React now,
+					// don't wait for handshake expiry.
+					if fails := atomic.LoadInt64(&dialFailCount); fails >= 3 {
+						atomic.StoreInt64(&dialFailCount, 0)
+						failover(fmt.Sprintf("%d consecutive dial failures", fails))
+						continue
+					}
+					// Signal 2: transfer counters frozen across two ticks
+					// while NEW requests arrived = data stall. (Idle
+					// periods freeze counters normally, so gate on
+					// fresh requests since the last tick.)
+					rx, tx, terr := ifaceTransfer(egress)
+					reqs := atomic.LoadInt64(&reqCount)
+					if terr == nil {
+						if rx == lastRx && tx == lastTx && reqs > lastReqCount && lastRx+lastTx > 0 {
+							lastReqCount = reqs
+							failover("transfer stall (counters frozen)")
+							continue
+						}
+						lastRx, lastTx = rx, tx
+						lastReqCount = reqs
+					}
+					// Signal 3: handshake freshness (original check).
 					if vpnHealthy(egress) {
 						if failStreak > 0 && *verbose {
 							fmt.Println("✅ tunnel healthy again, killswitch off")
@@ -759,23 +943,18 @@ func cmdProxy(args []string) {
 						setKillswitch(routed, false, egress)
 						continue
 					}
-					failStreak++
-					fmt.Printf("⚠️  tunnel unhealthy (streak %d) — killswitch ON, re-activating\n", failStreak)
-					setKillswitch(routed, true, egress)
-					backoff(failStreak)
-					if next, err := activate(egress, peers, cur+1, *timeout, *verbose); err == nil {
-						cur = next
-						atomic.StoreInt64(&activeIdx, int64(cur))
-						markActive()
-					}
+					failover("stale handshake")
 				case <-rotTick.C:
 					ensureDaemon(standby)
-					next, err := rotateStandby(peers, cur, standby, *timeout, *verbose)
+					next, err := rotateStandby(peers, cur, standby, *timeout, *verbose, stats)
 					if err != nil {
 						fmt.Println("⚠️  rotation failed, keeping current peer:", err)
 						backoff(1)
 						continue
 					}
+					// Snapshot the OLD peer's totals before flipping, or its
+					// traffic gets attributed to the new peer.
+					snapshotTransfer(egress, peers[cur].Name, stats)
 					// Flip traffic to warmed standby, drop old peer, swap roles.
 					oldEgress, oldPeer := egress, cur
 					egress = standby
@@ -785,7 +964,6 @@ func cmdProxy(args []string) {
 					cur = next
 					atomic.StoreInt64(&activeIdx, int64(cur))
 					markActive()
-					snapshotTransfer(egress, peers[cur].Name, stats)
 					saveStats(*statsPath, stats)
 					fmt.Printf("🔄 Rotated to peer [%d] %s (egress %s)\n", cur, peers[cur].Name, egress)
 				}
@@ -832,7 +1010,7 @@ func cmdRotate(args []string) {
 			start = v + 1
 		}
 	}
-	idx, err := activate(*iface, peers, start, *timeout, *verbose)
+	idx, err := activate(*iface, peers, start, *timeout, *verbose, nil)
 	if err != nil {
 		fmt.Println("❌", err)
 		os.Exit(1)
@@ -864,7 +1042,7 @@ func cmdList(args []string) {
 	}
 	age := handshakeAge(*iface)
 	stats := loadStats(*statsPath)
-	fmt.Printf("%-4s %-22s %-24s %-10s %-12s %s\n", "#", "NAME", "ENDPOINT", "REQUESTS", "TRANSFER", "STATUS")
+	fmt.Printf("%-4s %-22s %-24s %-10s %-22s %s\n", "#", "NAME", "ENDPOINT", "REQUESTS", "TRANSFER", "STATUS")
 	for i, p := range peers {
 		pst := stats[p.Name]
 		reqs, xfer := "-", "-"
@@ -873,6 +1051,10 @@ func cmdList(args []string) {
 			xfer = fmt.Sprintf("↓%.1fMB ↑%.1fMB", float64(pst.RxBytes)/1048576, float64(pst.TxBytes)/1048576)
 		}
 		st := ""
+		if skip, left := peerCooldown(stats, p.Name); skip {
+			pst := stats[p.Name]
+			st = fmt.Sprintf("⏭️  COOLDOWN (%s, %d fails)", left, pst.DialFails)
+		}
 		if i == active {
 			if age >= 0 {
 				st = fmt.Sprintf("✅ ACTIVE (handshake %ds ago)", age)
@@ -880,7 +1062,7 @@ func cmdList(args []string) {
 				st = "⚠️  ACTIVE (no handshake yet)"
 			}
 		}
-		fmt.Printf("%-4d %-22s %-24s %-10s %-12s %s\n", i, p.Name, p.Endpoint, reqs, xfer, st)
+		fmt.Printf("%-4d %-22s %-24s %-10s %-22s %s\n", i, p.Name, p.Endpoint, reqs, xfer, st)
 	}
 }
 
