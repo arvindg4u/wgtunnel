@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -138,6 +139,11 @@ func pathOK(ip, dev string) bool {
 // removing routes (absence would fall through to the direct tables).
 
 func setKillswitch(dsts []string, on bool, egress string) {
+	if on {
+		atomic.StoreInt64(&killswitchOn, 1)
+	} else {
+		atomic.StoreInt64(&killswitchOn, 0)
+	}
 	for _, d := range dsts {
 		d = strings.TrimSpace(d)
 		if strings.Contains(d, "/") {

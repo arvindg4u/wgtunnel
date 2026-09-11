@@ -547,6 +547,9 @@ var reqCount int64
 // rotating is 1 while doRotate warms/flips (drives the dashboard button).
 var rotating int64
 
+// killswitchOn mirrors setKillswitch (1 = routed traffic blackholed).
+var killswitchOn int64
+
 // lastRotateUnix tracks the last successful rotation (or startup) for the
 // dashboard countdown.
 var lastRotateUnix int64
@@ -937,6 +940,7 @@ func cmdProxy(args []string) {
 		go func() {
 			cur := idx
 			failStreak := 0
+			stallStreak := 0
 			healthTicks := 0
 			var lastRx, lastTx uint64
 			lastReqCount := atomic.LoadInt64(&reqCount)
@@ -969,32 +973,10 @@ func cmdProxy(args []string) {
 				st.LastFail = time.Now().UTC().Format(time.RFC3339) + " " + reason
 				saveStats(*statsPath, stats)
 			}
-			failover := func(reason string) {
-				failStreak++
-				fmt.Printf("⚠️  tunnel unhealthy (%s, streak %d) — killswitch ON, re-activating\n", reason, failStreak)
-				recordFail(peers[cur].Name, reason)
-				setKillswitch(routed, true, egress)
-				backoff(failStreak)
-				if next, err := activate(egress, peers, cur+1, *timeout, *verbose, stats, probeHosts); err == nil {
-					cur = next
-					atomic.StoreInt64(&activeIdx, int64(cur))
-					atomic.StoreInt64(&lastRotateUnix, time.Now().Unix())
-					markActive()
-					tr.reset(egress)
-					if rx, tx, err := ifaceTransfer(egress); err == nil {
-						lastRx, lastTx = rx, tx
-					}
-					lastReqCount = atomic.LoadInt64(&reqCount)
-					// Fresh peer just proved its data path; don't let
-					// in-flight failures on the dead peer trip another
-					// failover on the next tick.
-					atomic.StoreInt64(&dialFailCount, 0)
-				}
-			}
 			// Shared rotation path: warm standby, flip egress, drop old peer.
 			// markFail=true records the current peer as rate-limited/failed
 			// so cooldown skips it on the next pick.
-			doRotate := func(reason string, markFail bool) {
+			doRotate := func(reason string, markFail bool) bool {
 				atomic.StoreInt64(&rotating, 1)
 				defer atomic.StoreInt64(&rotating, 0)
 				if markFail {
@@ -1006,13 +988,13 @@ func cmdProxy(args []string) {
 				if err := ensureDaemon(standby); err != nil {
 					fmt.Println("⚠️  standby daemon:", err)
 					backoff(1)
-					return
+					return false
 				}
 				next, err := rotateStandby(peers, cur, standby, *timeout, *verbose, stats, probeHosts)
 				if err != nil {
 					fmt.Println("⚠️  rotation failed, keeping current peer:", err)
 					backoff(1)
-					return
+					return false
 				}
 				// Credit the OLD peer's final delta before flipping, or
 				// its traffic gets attributed to the new peer.
@@ -1029,6 +1011,40 @@ func cmdProxy(args []string) {
 				tr.reset(egress)
 				saveStats(*statsPath, stats)
 				fmt.Printf("🔄 Rotated to peer [%d] %s (egress %s, reason: %s)\n", cur, peers[cur].Name, egress, reason)
+				return true
+			}
+
+			failover := func(reason string) {
+				failStreak++
+				fmt.Printf("⚠️  tunnel unhealthy (%s, streak %d) — killswitch ON, failing over\n", reason, failStreak)
+				setKillswitch(routed, true, egress)
+				backoff(failStreak)
+				// Escape via the STANDBY iface first (same path as manual
+				// rotate): re-trying the broken egress iface just repeats
+				// the failure and strands traffic behind the killswitch.
+				if doRotate(reason, true) {
+					setKillswitch(routed, false, egress)
+					failStreak = 0
+					stallStreak = 0
+					atomic.StoreInt64(&dialFailCount, 0)
+					return
+				}
+				fmt.Println("⚠️  standby failover failed, last resort: same-iface re-activate")
+				if next, err := activate(egress, peers, cur+1, *timeout, *verbose, stats, probeHosts); err == nil {
+					cur = next
+					atomic.StoreInt64(&activeIdx, int64(cur))
+					atomic.StoreInt64(&lastRotateUnix, time.Now().Unix())
+					markActive()
+					tr.reset(egress)
+					if rx, tx, err := ifaceTransfer(egress); err == nil {
+						lastRx, lastTx = rx, tx
+					}
+					lastReqCount = atomic.LoadInt64(&reqCount)
+					// Fresh peer just proved its data path; don't let
+					// in-flight failures on the dead peer trip another
+					// failover on the next tick.
+					atomic.StoreInt64(&dialFailCount, 0)
+				}
 			}
 			// Jitter rotation start so restarts don't thunder.
 			time.Sleep(time.Duration(time.Now().UnixNano()%10) * time.Second)
@@ -1065,9 +1081,14 @@ func cmdProxy(args []string) {
 					if terr == nil {
 						if rx == lastRx && tx == lastTx && reqs > lastReqCount && lastRx+lastTx > 0 {
 							lastReqCount = reqs
-							failover("transfer stall (counters frozen)")
+							stallStreak++
+							if stallStreak >= 2 {
+								stallStreak = 0
+								failover("transfer stall (counters frozen)")
+							}
 							continue
 						}
+						stallStreak = 0
 						lastRx, lastTx = rx, tx
 						lastReqCount = reqs
 					}

@@ -54,6 +54,7 @@ type dashStatus struct {
 	Routes         string    `json:"routes"`
 	Listen         string    `json:"listen"`
 	Vips           []dashVIP `json:"vips"`
+	Killswitch     bool      `json:"killswitch"`
 	Rotating       bool      `json:"rotating"`
 	RotateInS      int64     `json:"rotate_in_s"`
 }
@@ -64,6 +65,7 @@ func fillDashLive(st *dashStatus, interval int, routes, listen string, start tim
 	st.UptimeS = int64(time.Since(start).Seconds())
 	st.Routes = routes
 	st.Listen = listen
+	st.Killswitch = atomic.LoadInt64(&killswitchOn) == 1
 	st.Rotating = atomic.LoadInt64(&rotating) == 1
 	if interval > 0 {
 		st.RotateInS = int64(interval) - (time.Now().Unix() - atomic.LoadInt64(&lastRotateUnix))
@@ -280,6 +282,7 @@ button.cta{background:var(--acc);border:none;color:var(--acc-ink);font-weight:70
 button.cta:hover{filter:brightness(1.08)}
 button.cta:disabled{opacity:.45;cursor:wait}
 #msg{font-size:13px;color:var(--dim)}
+.ks{display:none;background:color-mix(in srgb,var(--bad) 14%,transparent);border:1px solid color-mix(in srgb,var(--bad) 45%,transparent);color:var(--bad);font-weight:700;font-size:13px;padding:9px 14px;border-radius:10px;margin:12px 0 0}
 .chk{font-size:13px;color:var(--dim);display:inline-flex;align-items:center;gap:6px;cursor:pointer}
 pre{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;font-size:12px;max-height:260px;overflow:auto;white-space:pre-wrap;color:var(--code)}
 .routes{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:var(--dim)}
@@ -307,6 +310,7 @@ tr.active td{box-shadow:inset 0 2px 0 var(--acc)}
 <div><div class="eyebrow">Active egress</div><h1 id="hPeer">—</h1><div class="end mono" id="hEnd">—</div></div>
 <div class="side"><div class="eyebrow">Handshake · next rotation</div><div class="hs num"><span id="hHs">—</span> <small>ago</small> · <span id="cd">—</span></div><div class="eyebrow mono" id="sub" style="margin-top:4px">—</div></div>
 </div>
+<div class="ks" id="ks" role="alert">⛔ KILLSWITCH ON — routed traffic held, proxy failing over</div>
 <div class="meter" id="meter"></div>
 <section><h2>Probe targets</h2><div id="vips"><span class="routes">probing…</span></div></section>
 <section><h2>Peers</h2><div style="overflow-x:auto"><table>
@@ -369,6 +373,7 @@ async function refresh(){
       var vh='';
       for(var vi=0;vi<(s.vips||[]).length;vi++){vh+=vipHTML(s.vips[vi])}
       document.getElementById('vips').innerHTML=vh||'<span class="routes">no probe data yet</span>';
+      document.getElementById('ks').style.display=s.killswitch?'block':'none';
       document.getElementById('routes').textContent='routed: '+(s.routes||'(none)')+' · '+s.peers+' peers';
       var rb=document.getElementById('rot');
       if(s.rotating){rb.disabled=true;document.getElementById('msg').textContent='warming standby peer…'}
