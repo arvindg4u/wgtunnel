@@ -796,6 +796,37 @@ func cmdRestart(args []string) {
 	fmt.Printf("wgtunnel proxy starting (PID %d) — safe to close this terminal with nohup\n", cmd.Process.Pid)
 }
 
+// rotateRequest is a dashboard/API rotation order. Target -1 means "next
+// healthy peer"; >= 0 pins a specific peer index (cooldown bypassed, probe
+// still mandatory).
+type rotateRequest struct {
+	Reason string
+	Target int
+}
+
+// warmPeer brings one specific peer up on the standby iface and verifies
+// handshake AND data path. No cooldown check: the operator explicitly
+// asked for this peer. A failed probe still refuses the flip.
+func warmPeer(peers []Peer, target int, standby string, timeout int, verbose bool, probeHosts []string) (int, error) {
+	if target < 0 || target >= len(peers) {
+		return -1, fmt.Errorf("peer index %d out of range (0-%d)", target, len(peers)-1)
+	}
+	p := peers[target]
+	if verbose {
+		fmt.Printf("Warming requested peer [%d] %s on %s\n", target, p.Name, standby)
+	}
+	if err := applyPeer(standby, p); err != nil {
+		return -1, err
+	}
+	if !peerReady(standby, timeout, true, verbose, probeHosts) {
+		return -1, fmt.Errorf("peer [%d] %s no handshake/data", target, p.Name)
+	}
+	if verbose {
+		fmt.Printf("   peer [%d] %s warmed on %s\n", target, p.Name, standby)
+	}
+	return target, nil
+}
+
 func cmdProxy(args []string) {
 	fs := flag.NewFlagSet("proxy", flag.ExitOnError)
 	peersPath := fs.String("peers", "/root/wgtunnel/peers.json", "peer pool JSON")
@@ -825,7 +856,7 @@ func cmdProxy(args []string) {
 	sigRotate := make(chan os.Signal, 1)
 	signal.Notify(sigRotate, syscall.SIGUSR1)
 	// Dashboard rotate button (POST /api/rotate) feeds the same path.
-	rotateHTTP := make(chan string, 1)
+	rotateHTTP := make(chan rotateRequest, 1)
 	proxyStart := time.Now()
 	atomic.StoreInt64(&lastRotateUnix, proxyStart.Unix())
 	if err := ensureDaemon(*iface); err != nil {
@@ -976,7 +1007,7 @@ func cmdProxy(args []string) {
 			// Shared rotation path: warm standby, flip egress, drop old peer.
 			// markFail=true records the current peer as rate-limited/failed
 			// so cooldown skips it on the next pick.
-			doRotate := func(reason string, markFail bool) bool {
+			doRotate := func(reason string, markFail bool, target int) bool {
 				atomic.StoreInt64(&rotating, 1)
 				defer atomic.StoreInt64(&rotating, 0)
 				if markFail {
@@ -990,7 +1021,13 @@ func cmdProxy(args []string) {
 					backoff(1)
 					return false
 				}
-				next, err := rotateStandby(peers, cur, standby, *timeout, *verbose, stats, probeHosts)
+				var next int
+				var err error
+				if target >= 0 {
+					next, err = warmPeer(peers, target, standby, *timeout, *verbose, probeHosts)
+				} else {
+					next, err = rotateStandby(peers, cur, standby, *timeout, *verbose, stats, probeHosts)
+				}
 				if err != nil {
 					fmt.Println("⚠️  rotation failed, keeping current peer:", err)
 					backoff(1)
@@ -1023,7 +1060,7 @@ func cmdProxy(args []string) {
 				// Escape via the STANDBY iface first (same path as manual
 				// rotate): re-trying the broken egress iface just repeats
 				// the failure and strands traffic behind the killswitch.
-				if doRotate(reason, true) {
+				if doRotate(reason, true, -1) {
 					setKillswitch(routed, false, egress)
 					failStreak = 0
 					stallStreak = 0
@@ -1054,9 +1091,9 @@ func cmdProxy(args []string) {
 				case <-routeTick.C:
 					flipRoutes(egress)
 				case <-sigRotate:
-					doRotate("429/manual SIGUSR1", true)
-				case reason := <-rotateHTTP:
-					doRotate(reason, true)
+					doRotate("429/manual SIGUSR1", true, -1)
+				case req := <-rotateHTTP:
+					doRotate(req.Reason, req.Target < 0, req.Target)
 				case <-healthTick.C:
 					healthTicks++
 					if healthTicks%10 == 0 {
@@ -1104,7 +1141,7 @@ func cmdProxy(args []string) {
 					}
 					failover("stale handshake")
 				case <-rotTick.C:
-					doRotate("interval", false)
+					doRotate("interval", false, -1)
 				}
 			}
 		}()
@@ -1167,8 +1204,19 @@ func cmdProxy(args []string) {
 			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 			_, _ = w.Write(iconMaskPNG)
 		case r.URL.Path == "/api/rotate" && r.Method == "POST":
+			target := -1
+			if q := r.URL.Query().Get("peer"); q != "" {
+				v, err := strconv.Atoi(q)
+				if err != nil || v < -1 || v >= len(peers) {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = w.Write([]byte(`{"ok":false,"error":"bad peer index"}`))
+					return
+				}
+				target = v
+			}
 			select {
-			case rotateHTTP <- "dashboard":
+			case rotateHTTP <- rotateRequest{Reason: "dashboard", Target: target}:
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = w.Write([]byte(`{"ok":true}`))
 			default:

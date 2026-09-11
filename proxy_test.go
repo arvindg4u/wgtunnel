@@ -16,3 +16,16 @@ func TestSavedProxyRoutes(t *testing.T) {
 		t.Errorf("nil args must yield no routes: %q", routes)
 	}
 }
+
+func TestWarmPeerBounds(t *testing.T) {
+	peers := []Peer{{Name: "a"}, {Name: "b"}}
+	if _, err := warmPeer(peers, -1, "flare2", 1, false, nil); err == nil {
+		t.Error("negative index must fail without side effects")
+	}
+	if _, err := warmPeer(peers, 2, "flare2", 1, false, nil); err == nil {
+		t.Error("out-of-range index must fail without side effects")
+	}
+	if _, err := warmPeer(nil, 0, "flare2", 1, false, nil); err == nil {
+		t.Error("empty pool must fail without side effects")
+	}
+}

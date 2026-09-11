@@ -283,6 +283,7 @@ button.cta:hover{filter:brightness(1.08)}
 button.cta:disabled{opacity:.45;cursor:wait}
 #msg{font-size:13px;color:var(--dim)}
 .ks{display:none;background:color-mix(in srgb,var(--bad) 14%,transparent);border:1px solid color-mix(in srgb,var(--bad) 45%,transparent);color:var(--bad);font-weight:700;font-size:13px;padding:9px 14px;border-radius:10px;margin:12px 0 0}
+.sel{background:var(--panel);border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:9px 10px;font-size:13px;max-width:220px}
 .chk{font-size:13px;color:var(--dim);display:inline-flex;align-items:center;gap:6px;cursor:pointer}
 pre{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;font-size:12px;max-height:260px;overflow:auto;white-space:pre-wrap;color:var(--code)}
 .routes{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:var(--dim)}
@@ -319,6 +320,8 @@ tr.active td{box-shadow:inset 0 2px 0 var(--acc)}
 </table></div></section>
 <section><h2>Control</h2><div class="row">
 <button class="cta" id="rot" onclick="rotate()">Rotate now</button>
+<select class="sel" id="peersel" aria-label="Route a specific peer"></select>
+<button class="ghost" id="routebtn" type="button" onclick="routePeer()">Route</button>
 <span id="msg"></span>
 </div><div style="margin-top:10px" class="routes" id="routes"></div></section>
 <section id="logpanel"><h2>Live log</h2><div class="row" style="margin-bottom:8px"><label class="chk"><input type="checkbox" id="erronly"> errors only</label></div><pre id="log" role="log" aria-label="Proxy log">loading…</pre></section>
@@ -376,8 +379,9 @@ async function refresh(){
       document.getElementById('ks').style.display=s.killswitch?'block':'none';
       document.getElementById('routes').textContent='routed: '+(s.routes||'(none)')+' · '+s.peers+' peers';
       var rb=document.getElementById('rot');
-      if(s.rotating){rb.disabled=true;document.getElementById('msg').textContent='warming standby peer…'}
-      else if(!busy){rb.disabled=false}
+      fillPeerSelect(peers);
+      if(s.rotating){rb.disabled=true;document.getElementById('routebtn').disabled=true;document.getElementById('msg').textContent='warming standby peer…'}
+      else if(!busy){rb.disabled=false;document.getElementById('routebtn').disabled=false}
       var html='';
       for(var i=0;i<peers.length;i++){var p=peers[i];
         html+='<tr'+(p.active?' class="active"':'')+'><td data-l="#">'+p.index+'</td><td data-l="Peer"><b>'+esc(p.name)+'</b></td><td data-l="Endpoint" class="mono">'+esc(p.endpoint)+'</td><td data-l="Total" class="num">'+p.requests+'</td><td data-l="Today" class="num">'+p.today+'</td><td data-l="Yday" class="num">'+p.last_day+'</td><td data-l="Xfer" class="num">&#8595;'+p.rx_mb.toFixed(1)+' &#8593;'+p.tx_mb.toFixed(1)+'</td><td data-l="Status">'+stHTML(p)+'</td></tr>';
@@ -398,6 +402,29 @@ async function rotate(){
     var r=await fetch('/api/rotate',{method:'POST'});
     var j=await r.json();
     document.getElementById('msg').textContent=j.ok?'rotation started — warming standby peer':'busy: '+j.error;
+  }catch(e){document.getElementById('msg').textContent='request failed';}
+  setTimeout(function(){busy=false;refresh();},4000);
+}
+function fillPeerSelect(peers){
+  var sel=document.getElementById('peersel');
+  var keep=sel.value;
+  var html='';
+  for(var i=0;i<peers.length;i++){var p=peers[i];
+    var label=p.index+' · '+p.name+(p.active?' (active)':'');
+    html+='<option value="'+p.index+'"'+(p.active?' disabled':'')+'>'+esc(label)+'</option>';
+  }
+  sel.innerHTML=html;
+  if(keep!==''&&sel.querySelector('option[value="'+keep+'"]:not([disabled])')){sel.value=keep}
+}
+async function routePeer(){
+  var sel=document.getElementById('peersel');
+  if(busy||!sel||sel.value==='')return;busy=true;
+  var b=document.getElementById('routebtn');b.disabled=true;
+  document.getElementById('msg').textContent='warming peer '+sel.value+'…';
+  try{
+    var r=await fetch('/api/rotate?peer='+encodeURIComponent(sel.value),{method:'POST'});
+    var j=await r.json();
+    document.getElementById('msg').textContent=j.ok?'warming peer '+sel.value+' — standby proving itself':'busy: '+j.error;
   }catch(e){document.getElementById('msg').textContent='request failed';}
   setTimeout(function(){busy=false;refresh();},4000);
 }
