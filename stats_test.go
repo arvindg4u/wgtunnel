@@ -56,21 +56,30 @@ func TestRollDay(t *testing.T) {
 	}
 }
 
-func TestPickProbeHost(t *testing.T) {
+func TestPickProbeHosts(t *testing.T) {
 	cases := []struct {
 		in   []string
-		want string
+		want []string
 	}{
-		{[]string{"opencode.ai"}, "opencode.ai"},
-		{[]string{"10.0.0.1/8", "example.com"}, "example.com"},
-		{[]string{"1.2.3.0/24"}, "opencode.ai"},
-		{[]string{"", "  "}, "opencode.ai"},
-		{nil, "opencode.ai"},
-		{[]string{"172.65.90.22"}, "opencode.ai"},
+		{[]string{"opencode.ai"}, []string{"opencode.ai"}},
+		{[]string{"10.0.0.1/8", "example.com"}, []string{"example.com"}},
+		{[]string{"a.example.com", "b.example.com", "a.example.com"}, []string{"a.example.com", "b.example.com"}},
+		{[]string{"1.2.3.0/24"}, []string{"opencode.ai"}},
+		{[]string{"", "  "}, []string{"opencode.ai"}},
+		{nil, []string{"opencode.ai"}},
+		{[]string{"172.65.90.22"}, []string{"opencode.ai"}},
 	}
 	for _, c := range cases {
-		if got := pickProbeHost(c.in); got != c.want {
-			t.Errorf("pickProbeHost(%q)=%q want %q", c.in, got, c.want)
+		got := pickProbeHosts(c.in)
+		if len(got) != len(c.want) {
+			t.Errorf("pickProbeHosts(%q)=%q want %q", c.in, got, c.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("pickProbeHosts(%q)=%q want %q", c.in, got, c.want)
+				break
+			}
 		}
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -20,6 +21,17 @@ import (
 func sh(name string, args ...string) (string, error) {
 	out, err := exec.Command(name, args...).CombinedOutput()
 	return strings.TrimSpace(string(out)), err
+}
+
+// logMemStats records Go heap stats for post-mortem diagnosis (the proxy
+// twice vanished without a last word; supervisor exit codes + these numbers
+// distinguish OOM from external kills).
+func logMemStats(tag string) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	fmt.Printf("📊 mem[%s]: alloc=%.1fMB sys=%.1fMB heap_objects=%d gc=%d goroutines=%d\n",
+		tag, float64(m.Alloc)/1048576, float64(m.Sys)/1048576,
+		m.HeapObjects, m.NumGC, runtime.NumGoroutine())
 }
 
 // killStaleDaemon kills orphaned wireguard-go processes for iface whose
@@ -135,11 +147,12 @@ func handshakeAge(iface string) int64 {
 var probeHostIP = ""
 var probeHostName = ""
 
-// pickProbeHost returns the hostname to verify the data path against:
-// the first routed hostname, else opencode.ai. We probe what we route — a
-// generic IP-echo host may be blocked via tunnel egress while the real
-// destination works (observed: api.ipify.org dead, opencode.ai alive).
-func pickProbeHost(routed []string) string {
+// pickProbeHosts returns every routed hostname to verify the data path
+// against, else ["opencode.ai"]. We probe what we route — any single host
+// can go dark via tunnel egress while others work.
+func pickProbeHosts(routed []string) []string {
+	var hosts []string
+	seen := map[string]bool{}
 	for _, r := range routed {
 		r = strings.TrimSpace(r)
 		if r == "" || strings.Contains(r, "/") {
@@ -147,11 +160,18 @@ func pickProbeHost(routed []string) string {
 		}
 		for _, c := range r {
 			if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
-				return r
+				if !seen[r] {
+					seen[r] = true
+					hosts = append(hosts, r)
+				}
+				break
 			}
 		}
 	}
-	return "opencode.ai"
+	if len(hosts) == 0 {
+		hosts = []string{"opencode.ai"}
+	}
+	return hosts
 }
 
 // resolveProbeIPs returns up to 4 distinct IPv4 addresses for host.
@@ -172,44 +192,43 @@ func resolveProbeIPs(host string) []string {
 
 // probeDataPath sends real payload through iface to prove the data path
 // works, not just the handshake (servers throttle handshakes-ok/data-dead).
-// Tries every resolved IP: anycast frontends may block tunnel egress on
-// some VIPs while others work (observed: 2 of 4 opencode.ai IPs dead).
+// Tries every resolved IP of every given host: anycast frontends may block
+// tunnel egress on some VIPs while others work (observed: 2 of 4
+// opencode.ai IPs dead), and whole hosts can go dark too.
 // Returns true if bytes flow both ways within timeout.
-func probeDataPath(iface string, timeoutSec int, probeHost string) bool {
-	if probeHost == "" {
-		probeHost = "opencode.ai"
-	}
-	ips := resolveProbeIPs(probeHost)
-	if len(ips) == 0 {
-		return false
+func probeDataPath(iface string, timeoutSec int, hosts []string) bool {
+	if len(hosts) == 0 {
+		hosts = []string{"opencode.ai"}
 	}
 	perIP := timeoutSec
 	if perIP > 8 {
 		perIP = 8
 	}
-	for _, ip := range ips {
-		probeHostIP = ip
-		probeHostName = probeHost
-		routeDst := ip + "/32"
-		sh("ip", "route", "replace", routeDst, "dev", iface)
-		sh("ip", "rule", "add", "to", routeDst, "lookup", "main", "pref", "99")
-		time.Sleep(2 * time.Second)
-		ok := false
-		if pathOK(ip, iface) {
-			for attempt := 0; attempt < 2; attempt++ {
-				out, err := sh("curl", "-s", "--max-time", fmt.Sprint(perIP),
-					"--resolve", probeHost+":443:"+ip, "https://"+probeHost)
-				if err == nil && strings.TrimSpace(out) != "" {
-					ok = true
-					break
+	for _, probeHost := range hosts {
+		for _, ip := range resolveProbeIPs(probeHost) {
+			probeHostIP = ip
+			probeHostName = probeHost
+			routeDst := ip + "/32"
+			sh("ip", "route", "replace", routeDst, "dev", iface)
+			sh("ip", "rule", "add", "to", routeDst, "lookup", "main", "pref", "99")
+			time.Sleep(2 * time.Second)
+			ok := false
+			if pathOK(ip, iface) {
+				for attempt := 0; attempt < 2; attempt++ {
+					out, err := sh("curl", "-s", "--max-time", fmt.Sprint(perIP),
+						"--resolve", probeHost+":443:"+ip, "https://"+probeHost)
+					if err == nil && strings.TrimSpace(out) != "" {
+						ok = true
+						break
+					}
+					time.Sleep(2 * time.Second)
 				}
-				time.Sleep(2 * time.Second)
 			}
-		}
-		sh("ip", "route", "del", routeDst, "dev", iface)
-		sh("ip", "rule", "del", "to", routeDst, "lookup", "main", "pref", "99")
-		if ok {
-			return true
+			sh("ip", "route", "del", routeDst, "dev", iface)
+			sh("ip", "rule", "del", "to", routeDst, "lookup", "main", "pref", "99")
+			if ok {
+				return true
+			}
 		}
 	}
 	return false
@@ -235,7 +254,7 @@ func ifaceTransfer(iface string) (uint64, uint64, error) {
 
 // peerReady waits for a handshake then verifies the data path with a real
 // probe. Returns true only if payload actually flows through iface.
-func peerReady(iface string, timeout int, probe bool, verbose bool, probeHost string) bool {
+func peerReady(iface string, timeout int, probe bool, verbose bool, probeHosts []string) bool {
 	deadline := time.Now().Add(time.Duration(timeout) * time.Second)
 	probedOnce := false
 	for time.Now().Before(deadline) {
@@ -244,7 +263,7 @@ func peerReady(iface string, timeout int, probe bool, verbose bool, probeHost st
 			if !probe {
 				return true
 			}
-			if probeDataPath(iface, 15, probeHost) {
+			if probeDataPath(iface, 15, probeHosts) {
 				return true
 			}
 			if probedOnce {
@@ -262,33 +281,45 @@ func peerReady(iface string, timeout int, probe bool, verbose bool, probeHost st
 // activate walks peers round-robin from start and activates the first
 // that completes a handshake within timeout. Returns peer index.
 // Pass nil stats to disable cooldown skipping (e.g. manual rotate).
-func activate(iface string, peers []Peer, start, timeout int, verbose bool, stats map[string]*PeerStats, probeHost string) (int, error) {
+// Desperation mode: if a full pass fails and peers were skipped for
+// cooldown, a second pass tries everyone — any tunnel beats total outage.
+func activate(iface string, peers []Peer, start, timeout int, verbose bool, stats map[string]*PeerStats, probeHosts []string) (int, error) {
 	n := len(peers)
-	for k := 0; k < n; k++ {
-		i := (start + k) % n
-		p := peers[i]
-		if stats != nil {
-			if skip, left := peerCooldown(stats, p.Name); skip && n > 1 {
-				if verbose {
-					fmt.Printf("   ⏭️  peer [%d] %s in cooldown (%s), skipping\n", i, p.Name, left)
+	skippedCooldown := 0
+	for pass := 0; pass < 2; pass++ {
+		if pass == 1 {
+			if skippedCooldown == 0 {
+				break // nothing was skipped; retry would be identical
+			}
+			fmt.Printf("⚠️  all peers failed (%d in cooldown) — desperation pass, ignoring cooldowns\n", skippedCooldown)
+		}
+		for k := 0; k < n; k++ {
+			i := (start + k) % n
+			p := peers[i]
+			if stats != nil && pass == 0 {
+				if skip, left := peerCooldown(stats, p.Name); skip && n > 1 {
+					if verbose {
+						fmt.Printf("   ⏭️  peer [%d] %s in cooldown (%s), skipping\n", i, p.Name, left)
+					}
+					skippedCooldown++
+					continue
 				}
+			}
+			if verbose {
+				fmt.Printf("🔄 Trying peer [%d] %s (%s)\n", i, p.Name, p.Endpoint)
+			}
+			if err := applyPeer(iface, p); err != nil {
+				fmt.Printf("   ✗ apply failed: %v\n", err)
 				continue
 			}
-		}
-		if verbose {
-			fmt.Printf("🔄 Trying peer [%d] %s (%s)\n", i, p.Name, p.Endpoint)
-		}
-		if err := applyPeer(iface, p); err != nil {
-			fmt.Printf("   ✗ apply failed: %v\n", err)
-			continue
-		}
-		if peerReady(iface, timeout, true, verbose, probeHost) {
-			if verbose {
-				fmt.Printf("   ✅ peer [%d] %s handshake + data ok\n", i, p.Name)
+			if peerReady(iface, timeout, true, verbose, probeHosts) {
+				if verbose {
+					fmt.Printf("   ✅ peer [%d] %s handshake + data ok\n", i, p.Name)
+				}
+				return i, nil
 			}
-			return i, nil
+			fmt.Printf("   ✗ peer [%d] %s no handshake/data, skipping\n", i, p.Name)
 		}
-		fmt.Printf("   ✗ peer [%d] %s no handshake/data, skipping\n", i, p.Name)
 	}
 	return -1, fmt.Errorf("no healthy peer")
 }
@@ -458,33 +489,52 @@ func removePeer(iface, pubkey string) {
 // rotateStandby brings the next peer up on the standby iface and verifies
 // handshake AND data path. Recently-failed peers are skipped (cooldown).
 // Caller flips routes to the standby first, then drops the old peer.
-func rotateStandby(peers []Peer, cur int, standby string, timeout int, verbose bool, stats map[string]*PeerStats, probeHost string) (int, error) {
+// Desperation mode: if every candidate is cooling down, a second pass tries
+// everyone — any tunnel beats total outage.
+// rotateStandby brings the next peer up on the standby iface and verifies
+// handshake AND data path. Recently-failed peers are skipped (cooldown).
+// Caller flips routes to the standby first, then drops the old peer.
+// Desperation mode: if every candidate is cooling down, a second pass tries
+// everyone — any tunnel beats total outage.
+func rotateStandby(peers []Peer, cur int, standby string, timeout int, verbose bool, stats map[string]*PeerStats, probeHosts []string) (int, error) {
 	n := len(peers)
-	for k := 1; k <= n; k++ {
-		next := (cur + k) % n
-		p := peers[next]
-		if skip, left := peerCooldown(stats, p.Name); skip {
-			if verbose {
-				fmt.Printf("   ⏭️  peer [%d] %s in cooldown (%s), skipping\n", next, p.Name, left)
+	skippedCooldown := 0
+	for pass := 0; pass < 2; pass++ {
+		if pass == 1 {
+			if skippedCooldown == 0 {
+				break
 			}
-			continue
+			fmt.Printf("⚠️  all standby candidates failed (%d in cooldown) — desperation pass, ignoring cooldowns\n", skippedCooldown)
 		}
-		if verbose {
-			fmt.Printf("🔄 Warming standby peer [%d] %s on %s\n", next, p.Name, standby)
+		for k := 1; k <= n; k++ {
+			next := (cur + k) % n
+			p := peers[next]
+			if pass == 0 {
+				if skip, left := peerCooldown(stats, p.Name); skip {
+					if verbose {
+						fmt.Printf("   ⏭️  peer [%d] %s in cooldown (%s), skipping\n", next, p.Name, left)
+					}
+					skippedCooldown++
+					continue
+				}
+			}
+			if verbose {
+				fmt.Printf("🔄 Warming standby peer [%d] %s on %s\n", next, p.Name, standby)
+			}
+			if err := applyPeer(standby, p); err != nil {
+				fmt.Printf("   ✗ apply failed: %v\n", err)
+				continue
+			}
+			if !peerReady(standby, timeout, true, verbose, probeHosts) {
+				fmt.Printf("   ✗ peer [%d] no handshake/data, trying next\n", next)
+				continue
+			}
+			// Standby verified; caller flips routes, then drops old peer.
+			if verbose {
+				fmt.Printf("   ✅ peer [%d] %s warmed on %s\n", next, p.Name, standby)
+			}
+			return next, nil
 		}
-		if err := applyPeer(standby, p); err != nil {
-			fmt.Printf("   ✗ apply failed: %v\n", err)
-			continue
-		}
-		if !peerReady(standby, timeout, true, verbose, probeHost) {
-			fmt.Printf("   ✗ peer [%d] no handshake/data, trying next\n", next)
-			continue
-		}
-		// Standby verified; caller flips routes, then drops old peer.
-		if verbose {
-			fmt.Printf("   ✅ peer [%d] %s warmed on %s\n", next, p.Name, standby)
-		}
-		return next, nil
 	}
 	return cur, fmt.Errorf("no healthy standby peer")
 }
@@ -749,9 +799,9 @@ func cmdProxy(args []string) {
 	}
 	// Data-path probes hit the routed host itself: generic IP-echo hosts
 	// may be blocked via tunnel egress while the real destination works.
-	probeHost := pickProbeHost(routed)
-	fmt.Printf("🔍 data-path probe target: %s\n", probeHost)
-	idx, err := activate(*iface, peers, 0, *timeout, *verbose, bootStats, probeHost)
+	probeHosts := pickProbeHosts(routed)
+	fmt.Printf("🔍 data-path probe targets: %s\n", strings.Join(probeHosts, ", "))
+	idx, err := activate(*iface, peers, 0, *timeout, *verbose, bootStats, probeHosts)
 	if err != nil {
 		fmt.Println("❌", err)
 		os.Exit(1)
@@ -768,13 +818,16 @@ func cmdProxy(args []string) {
 	if *useDNS {
 		enableDNS(egress)
 	}
-	// Always clean up on SIGINT/SIGTERM: policy routes/rules must not
-	// outlive the proxy (stale entries shadow later probes), DNS restored.
+	// Always clean up on SIGINT/SIGTERM/SIGHUP: policy routes/rules must
+	// not outlive the proxy (stale entries shadow later probes), DNS
+	// restored. SIGHUP is caught (not reload) so it can never kill the
+	// proxy silently with the default disposition.
 	sigc := make(chan os.Signal, 1)
-	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	go func() {
-		<-sigc
-		fmt.Println("\n🛑 shutting down, cleaning routes...")
+		sig := <-sigc
+		fmt.Printf("\n🛑 shutting down on %s, cleaning routes...\n", sig)
+		logMemStats("exit")
 		cleanupRoutes(routed)
 		if *useDNS {
 			restoreDNS()
@@ -802,6 +855,8 @@ func cmdProxy(args []string) {
 	fmt.Println("================================================================================")
 	fmt.Println("🚀 WGTunnel Proxy Started")
 	fmt.Println("================================================================================")
+	fmt.Printf("🧰 runtime: %s pid=%d\n", runtime.Version(), os.Getpid())
+	logMemStats("baseline")
 	fmt.Printf("📡 Listening: %s\n", *listen)
 	fmt.Printf("🔗 Active peer: [%d] %s\n", idx, peers[idx].Name)
 	fmt.Printf("🔄 Rotation: every %ds across %d peers\n", *interval, len(peers))
@@ -828,6 +883,7 @@ func cmdProxy(args []string) {
 		go func() {
 			cur := idx
 			failStreak := 0
+			healthTicks := 0
 			var lastRx, lastTx uint64
 			lastReqCount := atomic.LoadInt64(&reqCount)
 			tr := &transferTracker{}
@@ -865,7 +921,7 @@ func cmdProxy(args []string) {
 				recordFail(peers[cur].Name, reason)
 				setKillswitch(routed, true, egress)
 				backoff(failStreak)
-				if next, err := activate(egress, peers, cur+1, *timeout, *verbose, stats, probeHost); err == nil {
+				if next, err := activate(egress, peers, cur+1, *timeout, *verbose, stats, probeHosts); err == nil {
 					cur = next
 					atomic.StoreInt64(&activeIdx, int64(cur))
 					markActive()
@@ -895,7 +951,7 @@ func cmdProxy(args []string) {
 					backoff(1)
 					return
 				}
-				next, err := rotateStandby(peers, cur, standby, *timeout, *verbose, stats, probeHost)
+				next, err := rotateStandby(peers, cur, standby, *timeout, *verbose, stats, probeHosts)
 				if err != nil {
 					fmt.Println("⚠️  rotation failed, keeping current peer:", err)
 					backoff(1)
@@ -928,6 +984,10 @@ func cmdProxy(args []string) {
 				case reason := <-rotateHTTP:
 					doRotate(reason, true)
 				case <-healthTick.C:
+					healthTicks++
+					if healthTicks%10 == 0 {
+						logMemStats("health") // ~every 5min: OOM forensics
+					}
 					// Signal 1: consecutive upstream dial failures =
 					// blackhole even with a fresh handshake. React now,
 					// don't wait for handshake expiry.

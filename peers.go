@@ -56,7 +56,7 @@ func cmdRotate(args []string) {
 			start = v + 1
 		}
 	}
-	idx, err := activate(*iface, peers, start, *timeout, *verbose, nil, "opencode.ai")
+	idx, err := activate(*iface, peers, start, *timeout, *verbose, nil, []string{"opencode.ai"})
 	if err != nil {
 		fmt.Println("❌", err)
 		os.Exit(1)
@@ -218,11 +218,11 @@ func cmdTest(args []string) {
 	}
 	// Data-path check hits opencode.ai (what we route): generic IP-echo
 	// hosts may be blocked via tunnel egress while real traffic works.
-	probeHost := "opencode.ai"
+	probeHosts := []string{"opencode.ai"}
 	defer func() {
 		sh("ip", "link", "del", "dev", *iface)
 	}()
-	fmt.Printf("%-4s %-22s %-16s %s\n", "#", "NAME", "ENDPOINT", "PROBE "+probeHost)
+	fmt.Printf("%-4s %-22s %-16s %s\n", "#", "NAME", "ENDPOINT", "PROBE "+strings.Join(probeHosts, ","))
 	for ti, i := range targets {
 		p := peers[i]
 		if err := applyPeer(*iface, p); err != nil {
@@ -242,7 +242,7 @@ func cmdTest(args []string) {
 			fmt.Printf("%-4d %-22s %-16s ✗ no handshake\n", i, p.Name, p.Endpoint)
 			continue
 		}
-		if !probeDataPath(*iface, 15, probeHost) {
+		if !probeDataPath(*iface, 15, probeHosts) {
 			fmt.Printf("%-4d %-22s %-16s ✗ probe failed\n", i, p.Name, p.Endpoint)
 			continue
 		}
