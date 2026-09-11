@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -82,4 +83,26 @@ func TestPickProbeHosts(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestFillDashLiveCountdown(t *testing.T) {
+	start := time.Now().Add(-100 * time.Second)
+	atomic.StoreInt64(&lastRotateUnix, start.Unix())
+	var st dashStatus
+	fillDashLive(&st, 1800, "opencode.ai", "127.0.0.1:8080", start)
+	if st.UptimeS < 99 || st.UptimeS > 110 {
+		t.Errorf("uptime=%d want ~100", st.UptimeS)
+	}
+	if st.RotateInS < 1690 || st.RotateInS > 1700 {
+		t.Errorf("rotate_in=%d want ~1700 (no rotation since start)", st.RotateInS)
+	}
+	if st.Rotating {
+		t.Error("rotating should be false with no rotation in flight")
+	}
+	atomic.StoreInt64(&rotating, 1)
+	fillDashLive(&st, 1800, "", "", start)
+	if !st.Rotating {
+		t.Error("rotating flag should reflect in-flight rotation")
+	}
+	atomic.StoreInt64(&rotating, 0)
 }

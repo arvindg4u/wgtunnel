@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -543,6 +544,49 @@ func rotateStandby(peers []Peer, cur int, standby string, timeout int, verbose b
 
 var reqCount int64
 
+// rotating is 1 while doRotate warms/flips (drives the dashboard button).
+var rotating int64
+
+// lastRotateUnix tracks the last successful rotation (or startup) for the
+// dashboard countdown.
+var lastRotateUnix int64
+
+// vipHealth records per-VIP reachability (ip -> result). Filled ONLY by the
+// background VIP checker, which verifies VIPs through the proxy itself as
+// ordinary CONNECT traffic. It never touches WireGuard config, kernel
+// routes, or the activation probe path.
+type vipResult struct {
+	Host string
+	OK   bool
+	At   time.Time
+}
+
+var (
+	vipMu     sync.RWMutex
+	vipHealth = map[string]*vipResult{}
+)
+
+func noteVIP(host, ip string, ok bool) {
+	vipMu.Lock()
+	vipHealth[ip] = &vipResult{Host: host, OK: ok, At: time.Now()}
+	vipMu.Unlock()
+}
+
+// checkVIPs fetches https://host once per resolved VIP through the local
+// proxy (one CONNECT each, counted as normal requests). Slow cadence:
+// every call is a few requests of observability noise.
+func checkVIPs(listen string, hosts []string) {
+	for _, host := range hosts {
+		for _, ip := range resolveProbeIPs(host) {
+			out, err := sh("curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+				"--max-time", "10", "-x", "http://"+listen,
+				"--resolve", host+":443:"+ip, "https://"+host+"/")
+			code := strings.TrimSpace(out)
+			noteVIP(host, ip, err == nil && len(code) == 3 && (code[0] == '2' || code[0] == '3'))
+		}
+	}
+}
+
 // dialFailCount counts consecutive upstream dial failures across all
 // handler goroutines. The health monitor reads it to detect a data-path
 // blackhole (handshake alive, payload dead) that handshakeAge can't see.
@@ -780,6 +824,7 @@ func cmdProxy(args []string) {
 	// Dashboard rotate button (POST /api/rotate) feeds the same path.
 	rotateHTTP := make(chan string, 1)
 	proxyStart := time.Now()
+	atomic.StoreInt64(&lastRotateUnix, proxyStart.Unix())
 	if err := ensureDaemon(*iface); err != nil {
 		fmt.Println("❌", err)
 		os.Exit(1)
@@ -851,6 +896,15 @@ func cmdProxy(args []string) {
 		st.LastActive = time.Now().UTC().Format(time.RFC3339)
 		saveStats(*statsPath, stats)
 	}
+	// Background VIP health checker: purely observational traffic through
+	// the proxy itself. Never touches the activation probe path.
+	go func() {
+		time.Sleep(30 * time.Second)
+		for {
+			checkVIPs(*listen, probeHosts)
+			time.Sleep(60 * time.Second)
+		}
+	}()
 	markActive()
 	fmt.Println("================================================================================")
 	fmt.Println("🚀 WGTunnel Proxy Started")
@@ -924,6 +978,7 @@ func cmdProxy(args []string) {
 				if next, err := activate(egress, peers, cur+1, *timeout, *verbose, stats, probeHosts); err == nil {
 					cur = next
 					atomic.StoreInt64(&activeIdx, int64(cur))
+					atomic.StoreInt64(&lastRotateUnix, time.Now().Unix())
 					markActive()
 					tr.reset(egress)
 					if rx, tx, err := ifaceTransfer(egress); err == nil {
@@ -940,6 +995,8 @@ func cmdProxy(args []string) {
 			// markFail=true records the current peer as rate-limited/failed
 			// so cooldown skips it on the next pick.
 			doRotate := func(reason string, markFail bool) {
+				atomic.StoreInt64(&rotating, 1)
+				defer atomic.StoreInt64(&rotating, 0)
 				if markFail {
 					fmt.Printf("📻 rotate trigger (%s) — marking [%d] %s rate-limited\n", reason, cur, peers[cur].Name)
 					recordFail(peers[cur].Name, reason)
@@ -1047,10 +1104,7 @@ func cmdProxy(args []string) {
 			_, _ = w.Write([]byte(dashHTML))
 		case r.URL.Path == "/api/status" && r.Method == "GET":
 			_, st := dashSnapshot(peers, *iface, *statsPath)
-			st.IntervalS = *interval
-			st.UptimeS = int64(time.Since(proxyStart).Seconds())
-			st.Routes = *routes
-			st.Listen = *listen
+			fillDashLive(&st, *interval, *routes, *listen, proxyStart)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(st)
 		case r.URL.Path == "/api/peers" && r.Method == "GET":
@@ -1060,6 +1114,15 @@ func cmdProxy(args []string) {
 		case r.URL.Path == "/api/log" && r.Method == "GET":
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string][]string{"lines": dashLogTail("/tmp/wgtunnel.log", 40)})
+		case r.URL.Path == "/api/snapshot" && r.Method == "GET":
+			list, st := dashSnapshot(peers, *iface, *statsPath)
+			fillDashLive(&st, *interval, *routes, *listen, proxyStart)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": st,
+				"peers":  list,
+				"lines":  dashLogTail("/tmp/wgtunnel.log", 40),
+			})
 		case r.URL.Path == "/manifest.webmanifest" && r.Method == "GET":
 			w.Header().Set("Content-Type", "application/manifest+json")
 			w.Header().Set("Cache-Control", "public, max-age=3600")

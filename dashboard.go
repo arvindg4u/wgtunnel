@@ -3,7 +3,10 @@ package main
 import (
 	"encoding/base64"
 	"os"
+	"sort"
 	"strings"
+	"sync/atomic"
+	"time"
 )
 
 // ---- Dashboard (same port as the proxy) ----
@@ -27,21 +30,63 @@ type dashPeer struct {
 	HandshakeS int64   `json:"handshake_s"`
 }
 
+type dashVIP struct {
+	IP    string `json:"ip"`
+	Host  string `json:"host"`
+	OK    bool   `json:"ok"`
+	AgeS  int64  `json:"age_s"`
+	Stale bool   `json:"stale"`
+}
+
 type dashStatus struct {
-	ActivePeer     string  `json:"active_peer"`
-	ActiveEndpoint string  `json:"active_endpoint"`
-	Iface          string  `json:"iface"`
-	HandshakeS     int64   `json:"handshake_s"`
-	ReqTotal       int64   `json:"req_total"`
-	ReqToday       int64   `json:"req_today"`
-	RxMB           float64 `json:"rx_mb"`
-	TxMB           float64 `json:"tx_mb"`
-	Peers          int     `json:"peers"`
-	Cooldowns      int     `json:"cooldowns"`
-	IntervalS      int     `json:"interval_s"`
-	UptimeS        int64   `json:"uptime_s"`
-	Routes         string  `json:"routes"`
-	Listen         string  `json:"listen"`
+	ActivePeer     string    `json:"active_peer"`
+	ActiveEndpoint string    `json:"active_endpoint"`
+	Iface          string    `json:"iface"`
+	HandshakeS     int64     `json:"handshake_s"`
+	ReqTotal       int64     `json:"req_total"`
+	ReqToday       int64     `json:"req_today"`
+	RxMB           float64   `json:"rx_mb"`
+	TxMB           float64   `json:"tx_mb"`
+	Peers          int       `json:"peers"`
+	Cooldowns      int       `json:"cooldowns"`
+	IntervalS      int       `json:"interval_s"`
+	UptimeS        int64     `json:"uptime_s"`
+	Routes         string    `json:"routes"`
+	Listen         string    `json:"listen"`
+	Vips           []dashVIP `json:"vips"`
+	Rotating       bool      `json:"rotating"`
+	RotateInS      int64     `json:"rotate_in_s"`
+}
+
+// fillDashLive sets the live (non-snapshot) status fields.
+func fillDashLive(st *dashStatus, interval int, routes, listen string, start time.Time) {
+	st.IntervalS = interval
+	st.UptimeS = int64(time.Since(start).Seconds())
+	st.Routes = routes
+	st.Listen = listen
+	st.Rotating = atomic.LoadInt64(&rotating) == 1
+	if interval > 0 {
+		st.RotateInS = int64(interval) - (time.Now().Unix() - atomic.LoadInt64(&lastRotateUnix))
+		if st.RotateInS < 0 {
+			st.RotateInS = 0
+		}
+	} else {
+		st.RotateInS = -1
+	}
+}
+
+// snapshotVIPs copies the VIP health map for the dashboard.
+func snapshotVIPs() []dashVIP {
+	vipMu.RLock()
+	defer vipMu.RUnlock()
+	now := time.Now()
+	out := make([]dashVIP, 0, len(vipHealth))
+	for ip, r := range vipHealth {
+		age := int64(now.Sub(r.At).Seconds())
+		out = append(out, dashVIP{IP: ip, Host: r.Host, OK: r.OK, AgeS: age, Stale: age > 300})
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a].IP < out[b].IP })
+	return out
 }
 
 // dashSnapshot reads the stats FILE (like `list` does), so dashboard polling
@@ -102,6 +147,7 @@ func dashSnapshot(peers []Peer, iface, statsPath string) ([]dashPeer, dashStatus
 		st.TxMB += dp.TxMB
 		out = append(out, dp)
 	}
+	st.Vips = snapshotVIPs()
 	return out, st
 }
 
@@ -137,10 +183,10 @@ var (
 	iconMaskPNG = mustDecodeIcon(iconMaskableB64)
 )
 
-const dashManifest = `{"name":"WGTunnel","short_name":"WGTunnel","id":"/","start_url":"/","scope":"/","display":"standalone","orientation":"any","theme_color":"#0b1020","background_color":"#0b1020","description":"Rotating WireGuard peer pool dashboard","icons":[{"src":"/icon-192.png","sizes":"192x192","type":"image/png","purpose":"any"},{"src":"/icon-512.png","sizes":"512x512","type":"image/png","purpose":"any"},{"src":"/icon-maskable-512.png","sizes":"512x512","type":"image/png","purpose":"maskable"}]}`
+const dashManifest = `{"name":"WGTunnel","short_name":"WGTunnel","id":"/","start_url":"/","scope":"/","display":"standalone","orientation":"any","theme_color":"#0b1020","background_color":"#0b1020","description":"Rotating WireGuard peer pool dashboard","shortcuts":[{"name":"View log","url":"/#logpanel","icons":[{"src":"/icon-192.png","sizes":"192x192","type":"image/png"}]}],"icons":[{"src":"/icon-192.png","sizes":"192x192","type":"image/png","purpose":"any"},{"src":"/icon-512.png","sizes":"512x512","type":"image/png","purpose":"any"},{"src":"/icon-maskable-512.png","sizes":"512x512","type":"image/png","purpose":"maskable"}]}`
 
 const dashSW = `'use strict';
-var CACHE='wgtunnel-v1';
+var CACHE='wgtunnel-v2';
 self.addEventListener('install',function(e){
   e.waitUntil(caches.open(CACHE).then(function(c){return c.addAll(['/', '/manifest.webmanifest'])}).then(function(){return self.skipWaiting()}));
 });
@@ -218,6 +264,20 @@ button.cta:disabled{opacity:.5;cursor:wait}
 pre{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:12px;font-size:12px;max-height:260px;overflow:auto;white-space:pre-wrap;color:var(--code)}
 .routes{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:var(--dim)}
 footer{text-align:center;color:var(--dim);font-size:12px;margin-top:8px}
+.vip{display:inline-flex;align-items:center;gap:6px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;padding:4px 10px;border:1px solid var(--line);border-radius:99px;margin:0 6px 6px 0}
+.vip i{width:9px;height:9px;border-radius:50%;background:var(--dim);display:inline-block}
+.vip.ok i{background:var(--ok);box-shadow:0 0 6px var(--ok)}
+.vip.bad i{background:var(--bad);box-shadow:0 0 6px var(--bad)}
+.vip .age{color:var(--dim);font-size:11px}
+.chk{font-size:13px;color:var(--dim);display:inline-flex;align-items:center;gap:6px;cursor:pointer}
+@media (max-width:640px){
+thead{display:none}
+table,tbody,tr,td{display:block;width:100%}
+tbody tr{border:1px solid var(--line);border-radius:10px;margin-bottom:8px;padding:4px 8px}
+tbody td{border:none;padding:5px 8px;display:flex;justify-content:space-between;align-items:center;gap:10px}
+tbody td:before{content:attr(data-l);color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.06em}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 </style>
 </head>
 <body>
@@ -226,21 +286,22 @@ footer{text-align:center;color:var(--dim);font-size:12px;margin-top:8px}
 <div><h1>WGTunnel</h1><div class="sub" id="sub">rotating WireGuard peer pool</div></div>
 <div class="spacer"></div>
 <button class="tbtn" id="theme" type="button" aria-label="Theme: system">&#9681; system</button>
-<div class="pill" id="pill">checking…</div>
+<div class="pill" id="pill" role="status" aria-live="polite">checking…</div>
 </header>
 <div class="grid" id="cards"></div>
+<div class="panel"><h2>Probe targets</h2><div id="vips"><span class="routes">probing…</span></div></div>
 <div class="panel"><h2>Peers</h2><div style="overflow-x:auto"><table>
-<thead><tr><th>#</th><th>Name</th><th>Endpoint</th><th>Total</th><th>Today</th><th>Yday</th><th>Transfer</th><th>Status</th></tr></thead>
+<thead><tr><th scope="col">#</th><th scope="col">Name</th><th scope="col">Endpoint</th><th scope="col">Total</th><th scope="col">Today</th><th scope="col">Yday</th><th scope="col">Transfer</th><th scope="col">Status</th></tr></thead>
 <tbody id="peers"></tbody>
 </table></div></div>
 <div class="panel"><h2>Control</h2><div class="row">
 <button class="cta" id="rot" onclick="rotate()">&#128260; Rotate now</button>
 <span id="msg"></span>
 </div><div style="margin-top:10px" class="routes" id="routes"></div></div>
-<div class="panel"><h2>Live log</h2><pre id="log">loading…</pre></div>
+<div class="panel" id="logpanel"><h2>Live log</h2><div class="row" style="margin-bottom:8px"><label class="chk"><input type="checkbox" id="erronly"> errors only</label></div><pre id="log" role="log" aria-label="Proxy log">loading…</pre></div>
 <footer>wgtunnel dashboard &middot; auto-refresh 3s &middot; localhost only</footer>
 <script>
-var busy=false,hadData=false,lastSig='';
+var busy=false,hadData=false,lastSig='',lastLines=[],cdLeft=-1;
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')}
 function fmtUptime(s){s=Math.floor(s);var h=Math.floor(s/3600),m=Math.floor(s%3600/60);if(h>0)return h+'h '+m+'m';if(m>0)return m+'m '+Math.floor(s%60)+'s';return s+'s'}
 var THEMES=['system','light','dark'],GLYPH={system:'&#9681;',light:'&#9728;',dark:'&#9729;'};
@@ -256,10 +317,21 @@ function badge(p){
 }
 function card(k,v,u){return '<div class="card"><div class="k">'+k+'</div><div class="v">'+v+' <span class="u">'+u+'</span></div></div>'}
 function setPill(mode,text){var pill=document.getElementById('pill');pill.textContent=text;pill.className='pill'+(mode==='ok'?'':mode==='stale'?' stale':' down')}
+function fmtCD(s){if(s<0)return 'off';s=Math.floor(s);var m=Math.floor(s/60);return m+':'+('0'+Math.floor(s%60)).slice(-2)}
+function vipHTML(v){
+  var cls=v.ok?'ok':'bad',txt=v.ok?'● ':'○ ';
+  var age=v.age_s<60?v.age_s+'s ago':Math.floor(v.age_s/60)+'m ago';
+  return '<span class="vip '+cls+'" title="'+esc(v.host||'')+' last probe '+age+(v.stale?' (stale)':'')+'"><i></i>'+esc(v.ip)+'<span class="age">'+age+'</span></span>';
+}
+function renderLog(){
+  var lines=lastLines;
+  if(document.getElementById('erronly').checked){lines=lines.filter(function(l){return /⚠️|✗|❌|⛔|error|fail|warn|down|stale|skip|kill|prohibit/i.test(l)})}
+  document.getElementById('log').textContent=lines.join('\n')||'(empty)';
+}
 async function refresh(){
   try{
-    var r=await fetch('/api/status');if(!r.ok)throw 0;var s=await r.json();
-    var r2=await fetch('/api/peers');var peers=await r2.json();
+    var r=await fetch('/api/snapshot');if(!r.ok)throw 0;var j=await r.json();
+    var s=j.status,peers=j.peers;lastLines=j.lines||[];
     var ok=s.handshake_s>=0&&s.handshake_s<180;
     setPill(ok?'ok':'down',ok?'● tunnel up':'● tunnel down');
     document.getElementById('sub').textContent='peer '+esc(s.active_peer||'?')+' on '+esc(s.iface||'?')+' · '+esc(s.listen||'');
@@ -272,16 +344,22 @@ async function refresh(){
         card('Requests today',s.req_today,'/ total '+s.req_total)+
         card('Transfer today','&#8595;'+s.rx_mb.toFixed(1)+' &#8593;'+s.tx_mb.toFixed(1),'MB')+
         card('Uptime',fmtUptime(s.uptime_s),'')+
-        card('Rotation','every '+s.interval_s+'s',s.cooldowns+' cooling');
+        card('Rotation','every '+s.interval_s+'s','<span id="cd">'+fmtCD(s.rotate_in_s)+'</span> · '+s.cooldowns+' cooling');
       document.getElementById('routes').textContent='routed: '+(s.routes||'(none)')+' · '+s.peers+' peers';
+      cdLeft=s.rotate_in_s;
+      var vh='';
+      for(var vi=0;vi<(s.vips||[]).length;vi++){vh+=vipHTML(s.vips[vi])}
+      document.getElementById('vips').innerHTML=vh||'<span class="routes">no probe data yet</span>';
+      var rb=document.getElementById('rot');
+      if(s.rotating){rb.disabled=true;document.getElementById('msg').textContent='warming standby peer…'}
+      else if(!busy){rb.disabled=false}
       var html='';
       for(var i=0;i<peers.length;i++){var p=peers[i];
-        html+='<tr'+(p.active?' class="active"':'')+'><td>'+p.index+'</td><td>'+esc(p.name)+'</td><td>'+esc(p.endpoint)+'</td><td>'+p.requests+'</td><td>'+p.today+'</td><td>'+p.last_day+'</td><td>&#8595;'+p.rx_mb.toFixed(1)+' &#8593;'+p.tx_mb.toFixed(1)+' MB</td><td>'+badge(p)+'</td></tr>';
+        html+='<tr'+(p.active?' class="active"':'')+'><td data-l="#">'+p.index+'</td><td data-l="Name">'+esc(p.name)+'</td><td data-l="Endpoint">'+esc(p.endpoint)+'</td><td data-l="Total">'+p.requests+'</td><td data-l="Today">'+p.today+'</td><td data-l="Yday">'+p.last_day+'</td><td data-l="Transfer">&#8595;'+p.rx_mb.toFixed(1)+' &#8593;'+p.tx_mb.toFixed(1)+' MB</td><td data-l="Status">'+badge(p)+'</td></tr>';
       }
       document.getElementById('peers').innerHTML=html;
     }
-    var r3=await fetch('/api/log');var lg=await r3.json();
-    document.getElementById('log').textContent=lg.lines.join('\n')||'(empty)';
+    renderLog();
     hadData=true;
   }catch(e){
     if(hadData){setPill('stale','● stale — retrying')}else{setPill('down','● unreachable')}
@@ -296,9 +374,11 @@ async function rotate(){
     var j=await r.json();
     document.getElementById('msg').textContent=j.ok?'rotation started — warming standby peer':'busy: '+j.error;
   }catch(e){document.getElementById('msg').textContent='request failed';}
-  setTimeout(function(){busy=false;b.disabled=false;refresh();},4000);
+  setTimeout(function(){busy=false;refresh();},4000);
 }
+document.getElementById('erronly').addEventListener('change',renderLog);
 function tick(){if(!document.hidden)refresh()}
+setInterval(function(){if(cdLeft>0){cdLeft--;var el=document.getElementById('cd');if(el)el.textContent=fmtCD(cdLeft)}},1000);
 if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catch(function(){})}
 refresh();setInterval(tick,3000);
 </script>
