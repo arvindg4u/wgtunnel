@@ -345,8 +345,7 @@ function setPill(mode,text){document.getElementById('ptxt').textContent=text;var
 function renderLog(){
   var lines=lastLines;
   if(document.getElementById('erronly').checked){lines=lines.filter(function(l){return /⚠️|✗|❌|⛔|error|fail|warn|down|stale|skip|kill|prohibit/i.test(l)})}
-  document.getElementById('log').textContent=lines.join('
-')||'(empty)';
+  document.getElementById('log').textContent=lines.join('\n')||'(empty)';
 }
 async function refresh(){
   try{
