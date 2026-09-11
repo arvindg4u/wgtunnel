@@ -6,3 +6,6 @@ wgtunnel
 peers.json
 *.conf
 !/peers.json.example
+
+# Local agent plans and scratch state
+.claude/

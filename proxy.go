@@ -200,10 +200,10 @@ func probeDataPath(iface string, timeoutSec int, hosts []string) bool {
 	if len(hosts) == 0 {
 		hosts = []string{"opencode.ai"}
 	}
+	// Honor the caller's timeout: healthy tunnel responses routinely take
+	// 6-8s; capping tighter turns slow-but-healthy peers into failures.
+	// Dead VIPs fail fast (RST), so a generous timeout costs nothing.
 	perIP := timeoutSec
-	if perIP > 8 {
-		perIP = 8
-	}
 	for _, probeHost := range hosts {
 		for _, ip := range resolveProbeIPs(probeHost) {
 			probeHostIP = ip
