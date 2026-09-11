@@ -10,6 +10,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -1195,6 +1196,27 @@ func cmdProxy(args []string) {
 		case r.URL.Path == "/api/log" && r.Method == "GET":
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string][]string{"lines": dashLogTail("/tmp/wgtunnel.log", 40)})
+		case r.URL.Path == "/manifest.webmanifest" && r.Method == "GET":
+			w.Header().Set("Content-Type", "application/manifest+json")
+			w.Header().Set("Cache-Control", "public, max-age=3600")
+			_, _ = w.Write([]byte(dashManifest))
+		case r.URL.Path == "/sw.js" && r.Method == "GET":
+			w.Header().Set("Content-Type", "application/javascript")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Service-Worker-Allowed", "/")
+			_, _ = w.Write([]byte(dashSW))
+		case r.URL.Path == "/icon-192.png" && r.Method == "GET":
+			w.Header().Set("Content-Type", "image/png")
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			_, _ = w.Write(icon192PNG)
+		case r.URL.Path == "/icon-512.png" && r.Method == "GET":
+			w.Header().Set("Content-Type", "image/png")
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			_, _ = w.Write(icon512PNG)
+		case r.URL.Path == "/icon-maskable-512.png" && r.Method == "GET":
+			w.Header().Set("Content-Type", "image/png")
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			_, _ = w.Write(iconMaskPNG)
 		case r.URL.Path == "/api/rotate" && r.Method == "POST":
 			select {
 			case rotateHTTP <- "dashboard":
@@ -1351,12 +1373,63 @@ func dashLogTail(path string, maxLines int) []string {
 	return lines
 }
 
+// ---- PWA (manifest + service worker + icons, all inline) ----
+
+func mustDecodeIcon(b64 string) []byte {
+	data, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		panic("bad embedded icon: " + err.Error())
+	}
+	return data
+}
+
+// Decoded once at startup; served from memory.
+var (
+	icon192PNG     = mustDecodeIcon(icon192B64)
+	icon512PNG     = mustDecodeIcon(icon512B64)
+	iconMaskPNG    = mustDecodeIcon(iconMaskableB64)
+)
+
+const dashManifest = `{"name":"WGTunnel","short_name":"WGTunnel","id":"/","start_url":"/","scope":"/","display":"standalone","orientation":"any","theme_color":"#0b1020","background_color":"#0b1020","description":"Rotating WireGuard peer pool dashboard","icons":[{"src":"/icon-192.png","sizes":"192x192","type":"image/png","purpose":"any"},{"src":"/icon-512.png","sizes":"512x512","type":"image/png","purpose":"any"},{"src":"/icon-maskable-512.png","sizes":"512x512","type":"image/png","purpose":"maskable"}]}`
+
+const dashSW = `'use strict';
+var CACHE='wgtunnel-v1';
+self.addEventListener('install',function(e){
+  e.waitUntil(caches.open(CACHE).then(function(c){return c.addAll(['/', '/manifest.webmanifest'])}).then(function(){return self.skipWaiting()}));
+});
+self.addEventListener('activate',function(e){
+  e.waitUntil(caches.keys().then(function(ks){return Promise.all(ks.map(function(k){if(k!==CACHE)return caches.delete(k)}))}).then(function(){return self.clients.claim()}));
+});
+self.addEventListener('fetch',function(e){
+  var r=e.request;
+  if(r.method!=='GET')return;
+  var u=new URL(r.url);
+  if(u.origin!==location.origin)return;
+  if(r.mode==='navigate'||u.pathname==='/'){
+    e.respondWith(fetch(r).then(function(res){var cp=res.clone();caches.open(CACHE).then(function(c){c.put('/',cp)});return res}).catch(function(){return caches.match('/')}));
+    return;
+  }
+  if(u.pathname.indexOf('/api/')===0){
+    e.respondWith(fetch(r).then(function(res){if(res.ok){var cp=res.clone();caches.open(CACHE).then(function(c){c.put(r,cp)})}return res}).catch(function(){return caches.match(r)}));
+    return;
+  }
+});`
+
 const dashHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>WGTunnel Dashboard</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#0b1020" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f1f5f9" media="(prefers-color-scheme: light)">
+<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
+<link rel="apple-touch-icon" href="/icon-192.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="WGTunnel">
 <script>(function(){try{var t=localStorage.getItem('wgt-theme');if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t)}catch(e){}})();</script>
 <style>
 :root{color-scheme:light;--bg:#f1f5f9;--card:#ffffff;--line:#e2e8f0;--txt:#0f172a;--dim:#64748b;--acc:#2563eb;--acc2:#7c3aed;--ok:#059669;--warn:#b45309;--bad:#dc2626;--code:#334155;--glow:rgba(37,99,235,.18)}
@@ -1479,6 +1552,7 @@ async function rotate(){
   setTimeout(function(){busy=false;b.disabled=false;refresh();},4000);
 }
 function tick(){if(!document.hidden)refresh()}
+if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catch(function(){})}
 refresh();setInterval(tick,3000);
 </script>
 </body>
