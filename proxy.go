@@ -1007,6 +1007,7 @@ func cmdProxy(args []string) {
 				removePeer(standby, peers[oldPeer].PublicKey)
 				cur = next
 				atomic.StoreInt64(&activeIdx, int64(cur))
+				atomic.StoreInt64(&lastRotateUnix, time.Now().Unix())
 				markActive()
 				tr.reset(egress)
 				saveStats(*statsPath, stats)
