@@ -17,10 +17,16 @@ type PeerStats struct {
 	TxBytes         uint64 `json:"tx_bytes"`
 	DialFails       int64  `json:"dial_fails"`
 	LastFail        string `json:"last_fail,omitempty"`
-	Day             string `json:"day,omitempty"` // IST date bucket YYYY-MM-DD
+	RateLimitedAt   string `json:"rate_limited_at,omitempty"` // RFC3339 of last 429 mark
+	Day             string `json:"day,omitempty"`             // IST date bucket YYYY-MM-DD
 	DayRequests     int64  `json:"day_requests"`
 	LastDayRequests int64  `json:"last_day_requests"`
 }
+
+// RateLimitCooldown keeps 429-marked peers out for a full upstream quota
+// window. Stored in the stats file, so it survives proxy restarts
+// (point --stats at a non-/tmp path to also survive reboots).
+const RateLimitCooldown = 15 * time.Hour
 
 // istZone is Asia/Kolkata without loading tzdata (fixed +05:30).
 var istZone = time.FixedZone("IST", 5*3600+1800)
@@ -105,12 +111,33 @@ func snapshotTransfer(tr *transferTracker, iface, peerName string, m map[string]
 	tr.credit(iface, peerName, m)
 }
 
+// fmtLeft renders a cooldown remainder like "45m left" or "14h05m left".
+func fmtLeft(d time.Duration) string {
+	if d < time.Hour {
+		m := int(d.Minutes()) + 1
+		return fmt.Sprintf("%dm left", m)
+	}
+	h := int(d.Hours())
+	return fmt.Sprintf("%dh%02dm left", h, int(d.Minutes())%60)
+}
+
 // peerCooldown reports whether peerName failed recently and should be
-// skipped this rotation round. Cooldown scales with failure count
-// (5min × fails, capped at 1h) so flaky peers get another chance later.
+// skipped this rotation round. Two lanes: 429 rate-limit marks hold the
+// full quota window (15h); other failures scale (5min × fails, cap 1h).
 func peerCooldown(m map[string]*PeerStats, peerName string) (bool, string) {
 	st := m[peerName]
-	if st == nil || st.LastFail == "" {
+	if st == nil {
+		return false, ""
+	}
+	if st.RateLimitedAt != "" {
+		if t, err := time.Parse(time.RFC3339, st.RateLimitedAt); err == nil {
+			if remain := time.Until(t.Add(RateLimitCooldown)); remain > 0 {
+				return true, fmtLeft(remain)
+			}
+			st.RateLimitedAt = "" // expired; cleared on next save
+		}
+	}
+	if st.LastFail == "" {
 		return false, ""
 	}
 	// LastFail format: RFC3339 + " " + reason.
@@ -124,7 +151,7 @@ func peerCooldown(m map[string]*PeerStats, peerName string) (bool, string) {
 		cool = time.Hour
 	}
 	if remain := time.Until(t.Add(cool)); remain > 0 {
-		return true, fmt.Sprintf("%.0fm left", remain.Minutes()+1)
+		return true, fmtLeft(remain)
 	}
 	return false, ""
 }

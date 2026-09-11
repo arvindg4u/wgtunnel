@@ -1002,6 +1002,11 @@ func cmdProxy(args []string) {
 				}
 				st.DialFails++
 				st.LastFail = time.Now().UTC().Format(time.RFC3339) + " " + reason
+				if strings.Contains(reason, "429") {
+					// Upstream rate limit: hold the full quota window,
+					// persisted in the stats file across restarts.
+					st.RateLimitedAt = time.Now().UTC().Format(time.RFC3339)
+				}
 				saveStats(*statsPath, stats)
 			}
 			// Shared rotation path: warm standby, flip egress, drop old peer.

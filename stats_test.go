@@ -106,3 +106,35 @@ func TestFillDashLiveCountdown(t *testing.T) {
 	}
 	atomic.StoreInt64(&rotating, 0)
 }
+
+func TestRateLimitCooldown15h(t *testing.T) {
+	now := time.Now().UTC()
+	m := map[string]*PeerStats{
+		"limited": {DialFails: 1, RateLimitedAt: now.Format(time.RFC3339),
+			LastFail: now.Format(time.RFC3339) + " 429/manual SIGUSR1"},
+		"expired": {DialFails: 1, RateLimitedAt: now.Add(-16 * time.Hour).Format(time.RFC3339)},
+		"bad-ts":  {RateLimitedAt: "not-a-time"},
+	}
+	skip, left := peerCooldown(m, "limited")
+	if !skip || left == "" {
+		t.Errorf("429-marked peer must hold 15h window, got skip=%v left=%q", skip, left)
+	}
+	if skip, _ := peerCooldown(m, "expired"); skip {
+		t.Error("16h-old 429 mark must have expired")
+	}
+	if m["expired"].RateLimitedAt != "" {
+		t.Error("expired mark should be cleared")
+	}
+	if skip, _ := peerCooldown(m, "bad-ts"); skip {
+		t.Error("unparseable mark must not trigger cooldown")
+	}
+}
+
+func TestFmtLeft(t *testing.T) {
+	if got := fmtLeft(45*time.Minute + 10*time.Second); got != "46m left" {
+		t.Errorf("fmtLeft sub-hour = %q", got)
+	}
+	if got := fmtLeft(14*time.Hour + 5*time.Minute); got != "14h05m left" {
+		t.Errorf("fmtLeft multi-hour = %q", got)
+	}
+}
